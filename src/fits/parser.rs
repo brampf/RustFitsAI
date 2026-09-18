@@ -5,10 +5,18 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
 use super::{Card, FitsError, FitsFile, Hdu, HduIndex, Header};
 
+/// Logical FITS block size from FITS 4.0 Sections 3.1-3.3.
 pub const BLOCK_SIZE: usize = 2880;
+/// FITS header keyword-record size from FITS 4.0 Section 3.3.1.
 pub const CARD_SIZE: usize = 80;
 const IO_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Sequential, buffered FITS reader.
+///
+/// `FitsReader` keeps only a bounded I/O buffer and the current Header Unit in
+/// memory. Callers must consume or skip the current Data Unit before requesting
+/// the next HDU. This matches the ordered structure required by FITS 4.0
+/// Sections 3.1 and 3.2 and avoids allocating very large Data Units.
 pub struct FitsReader<R> {
     reader: BufReader<R>,
     first_hdu: bool,
@@ -22,6 +30,7 @@ struct PendingData {
 }
 
 impl<R: Read> FitsReader<R> {
+    /// Creates a reader with a bounded internal buffer over any `Read` source.
     pub fn new(reader: R) -> Self {
         Self {
             reader: BufReader::with_capacity(IO_BUFFER_SIZE, reader),
@@ -31,6 +40,11 @@ impl<R: Read> FitsReader<R> {
         }
     }
 
+    /// Parses the next primary or conforming extension header.
+    ///
+    /// The returned [`HduIndex`] is an index into the still-streamed Data Unit.
+    /// `None` indicates that the reader reached the special-record section or
+    /// logical end of the FITS stream. See FITS 4.0 Sections 3.4 and 3.5.
     pub fn next_hdu(&mut self) -> Result<Option<HduIndex>, FitsError> {
         if self.pending_data.is_some() {
             return Err(FitsError::DataPending);
@@ -59,6 +73,10 @@ impl<R: Read> FitsReader<R> {
         Ok(Some(HduIndex { header, data_size }))
     }
 
+    /// Streams the current Data Unit to `writer` and discards its block padding.
+    ///
+    /// This is the preferred method for very large Data Units. FITS padding is
+    /// defined by the 2880-byte blocking rules in Sections 3.1, 3.2, and 3.6.
     pub fn read_data_to<W: Write>(&mut self, mut writer: W) -> Result<(), FitsError> {
         let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
         let padding = pending.padded_size - pending.size;
@@ -67,6 +85,10 @@ impl<R: Read> FitsReader<R> {
         Ok(())
     }
 
+    /// Reads the current Data Unit into memory on explicit request.
+    ///
+    /// Prefer [`FitsReader::read_data_to`] or [`FitsReader::skip_data`] when the
+    /// Data Unit may be large.
     pub fn read_data(&mut self) -> Result<Vec<u8>, FitsError> {
         let size = self
             .pending_data
@@ -82,16 +104,27 @@ impl<R: Read> FitsReader<R> {
         Ok(data)
     }
 
+    /// Consumes the current Data Unit without retaining its bytes.
     pub fn skip_data(&mut self) -> Result<(), FitsError> {
         self.read_data_to(io::sink())
     }
 
+    /// Collects trailing special records into memory.
+    ///
+    /// Special records are restricted-use 2880-byte blocks as described in
+    /// FITS 4.0 Section 3.5. Use [`FitsReader::copy_special_records_to`] for a
+    /// streaming alternative.
     pub fn read_special_records(&mut self) -> Result<Vec<Vec<u8>>, FitsError> {
         let mut bytes = Vec::new();
         self.copy_special_records_to(&mut bytes)?;
         Ok(bytes.chunks_exact(BLOCK_SIZE).map(Vec::from).collect())
     }
 
+    /// Streams trailing special records to `writer` and returns their count.
+    ///
+    /// The first eight bytes of each record are checked against the `XTENSION`
+    /// restriction in FITS 4.0 Section 3.5. A partial physical tail is ignored
+    /// as permitted by the physical-blocking rules in Section 3.6.1.
     pub fn copy_special_records_to<W: Write>(&mut self, mut writer: W) -> Result<usize, FitsError> {
         if !self.at_special_records {
             return Err(FitsError::SpecialRecordsNotReady);
@@ -161,7 +194,7 @@ fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
                 });
             }
             raw_cards.push(String::from_utf8_lossy(card_bytes).into_owned());
-            let keyword = String::from_utf8_lossy(&card_bytes[..8]).trim().to_string();
+            let keyword = keyword_name(&card_bytes[..8])?;
             if keyword == "END" {
                 found_end = true;
                 break;
@@ -169,12 +202,7 @@ fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
             if keyword.is_empty() {
                 continue;
             }
-            if card_bytes[8] != b'=' && keyword != "COMMENT" && keyword != "HISTORY" {
-                return Err(FitsError::InvalidKeyword {
-                    offset: header_size - BLOCK_SIZE,
-                });
-            }
-            cards.push(parse_card(card_bytes));
+            cards.push(parse_card(card_bytes, keyword)?);
         }
         if found_end {
             return Ok(Header {
@@ -212,24 +240,46 @@ fn io_error(error: io::Error) -> FitsError {
     FitsError::Io(error.to_string())
 }
 
-fn parse_card(card: &[u8]) -> Card {
-    let keyword = String::from_utf8_lossy(&card[..8]).trim().to_string();
-    if card[8] != b'=' {
-        let text = String::from_utf8_lossy(&card[8..]).trim().to_string();
-        return Card {
+fn keyword_name(field: &[u8]) -> Result<String, FitsError> {
+    let first_space = field.iter().position(|byte| *byte == b' ');
+    let name_end = first_space.unwrap_or(field.len());
+    if field[name_end..].iter().any(|byte| *byte != b' ') {
+        return Err(FitsError::InvalidKeywordName {
+            keyword: String::from_utf8_lossy(field).into_owned(),
+        });
+    }
+    for byte in &field[..name_end] {
+        if !(byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-') {
+            return Err(FitsError::InvalidKeywordName {
+                keyword: String::from_utf8_lossy(field).into_owned(),
+            });
+        }
+    }
+    Ok(String::from_utf8_lossy(&field[..name_end]).into_owned())
+}
+
+fn parse_card(card: &[u8], keyword: String) -> Result<Card, FitsError> {
+    let has_value_indicator = &card[8..10] == b"= ";
+    if card[8] == b'=' && !has_value_indicator {
+        return Err(FitsError::InvalidValueIndicator { keyword });
+    }
+    if !has_value_indicator || keyword == "COMMENT" || keyword == "HISTORY" {
+        let start = if has_value_indicator { 10 } else { 8 };
+        let text = String::from_utf8_lossy(&card[start..]).trim().to_string();
+        return Ok(Card {
             keyword,
             value: None,
             comment: (!text.is_empty()).then_some(text),
-        };
+        });
     }
 
     let field = String::from_utf8_lossy(&card[10..]);
     let (value, comment) = split_value_comment(&field);
-    Card {
+    Ok(Card {
         keyword,
         value: Some(value.trim().to_string()),
         comment,
-    }
+    })
 }
 
 fn split_value_comment(field: &str) -> (String, Option<String>) {

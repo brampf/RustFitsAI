@@ -3,6 +3,10 @@
 
 use std::fmt;
 
+/// Errors raised while validating FITS structure or streaming its blocks.
+///
+/// The structural constraints represented here primarily come from FITS 4.0
+/// Sections 3.1-3.6 and the header keyword rules in Section 4.4.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FitsError {
     Io(String),
@@ -10,6 +14,8 @@ pub enum FitsError {
     Truncated { offset: usize, expected: usize },
     InvalidHeader { offset: usize, message: String },
     InvalidKeyword { offset: usize },
+    InvalidKeywordName { keyword: String },
+    InvalidValueIndicator { keyword: String },
     InvalidValue { keyword: String, value: String },
     MissingExtensionType,
     InvalidSpecialRecords { offset: usize, message: String },
@@ -33,6 +39,15 @@ impl fmt::Display for FitsError {
             }
             Self::InvalidKeyword { offset } => {
                 write!(formatter, "invalid FITS keyword at byte {offset}")
+            }
+            Self::InvalidKeywordName { keyword } => {
+                write!(formatter, "invalid FITS keyword name: {keyword:?}")
+            }
+            Self::InvalidValueIndicator { keyword } => {
+                write!(
+                    formatter,
+                    "invalid value indicator for FITS keyword {keyword}"
+                )
             }
             Self::InvalidValue { keyword, value } => {
                 write!(formatter, "invalid value for {keyword}: {value}")

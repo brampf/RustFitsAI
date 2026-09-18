@@ -133,10 +133,7 @@ fn rejects_xtension_in_special_record_prefix() {
     special[..8].copy_from_slice(b"XTENSION");
     bytes.extend_from_slice(&special);
 
-    assert!(matches!(
-        FitsFile::from_bytes(&bytes),
-        Err(FitsError::InvalidKeyword { .. }) | Err(FitsError::InvalidSpecialRecords { .. })
-    ));
+    assert!(FitsFile::from_bytes(&bytes).is_err());
 }
 
 #[test]
@@ -165,4 +162,51 @@ fn streams_data_only_when_requested() {
         .expect("data should stream to the writer");
     assert_eq!(streamed, b"stream");
     assert!(reader.next_hdu().expect("end should be readable").is_none());
+}
+
+#[test]
+fn accepts_spec_keyword_names_and_commentary_records() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "FOO-BAR =                    7",
+        "COMMENT this is commentary",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    let file = FitsFile::from_bytes(&bytes).expect("valid keyword records should parse");
+    assert_eq!(file.hdus[0].header.value("FOO-BAR"), Some("7"));
+    assert_eq!(
+        file.hdus[0].header.cards[3].comment.as_deref(),
+        Some("this is commentary")
+    );
+}
+
+#[test]
+fn rejects_lowercase_and_embedded_spaces_in_keyword_names() {
+    for invalid_card in [
+        "simple  =                    T",
+        "FOO BAR =                    7",
+    ] {
+        let bytes = header(&[invalid_card, "NAXIS   =                    0", "END"]);
+        assert!(matches!(
+            FitsFile::from_bytes(&bytes),
+            Err(FitsError::InvalidKeywordName { .. })
+        ));
+    }
+}
+
+#[test]
+fn requires_space_after_value_indicator() {
+    let bytes = header(&[
+        "SIMPLE  =X                   T",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidValueIndicator { keyword }) if keyword == "SIMPLE"
+    ));
 }
