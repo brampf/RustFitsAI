@@ -30,6 +30,10 @@ decoder handles FITS big-endian signed integers and IEEE-754 values according
 to `BITPIX`; `BITPIX=8` is exposed as raw bytes because FITS uses it for both
 unsigned byte arrays and ASCII character data.
 
+Deprecated FITS random-groups primary arrays are recognized and validated
+according to Section 6. Their `PCOUNT`, `GCOUNT`, axes, and parameter metadata
+are available through `HduIndex::random_groups()`.
+
 Header Values are exposed as `Value::String`, `Value::Logical`, `Value::Integer`,
 `Value::Real`, `Value::ComplexInteger`, `Value::ComplexReal`, or
 `Value::Undefined`. Quoted strings decode doubled single quotes, and

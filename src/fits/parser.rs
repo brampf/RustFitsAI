@@ -656,6 +656,7 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
         .collect();
     let naxis = validate_integer(header, "NAXIS", |value| (0..=999).contains(&value))?;
     let naxis = naxis as usize;
+    let random_groups = primary && header.value("GROUPS") == Some("T");
     let mut expected: Vec<String> = if primary {
         vec![
             "SIMPLE".to_string(),
@@ -672,7 +673,13 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
     for axis in 1..=naxis {
         expected.push(format!("NAXIS{axis}"));
     }
-    if !primary {
+    if random_groups {
+        expected.extend([
+            "GROUPS".to_string(),
+            "PCOUNT".to_string(),
+            "GCOUNT".to_string(),
+        ]);
+    } else if !primary {
         expected.extend(["PCOUNT".to_string(), "GCOUNT".to_string()]);
     }
     for (index, expected_keyword) in expected.iter().enumerate() {
@@ -696,6 +703,14 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
         }
         validate_logical(header, "SIMPLE")?;
         validate_fixed_logical(header, "SIMPLE")?;
+        if random_groups {
+            validate_logical(header, "GROUPS")?;
+            validate_fixed_logical(header, "GROUPS")?;
+            validate_integer(header, "PCOUNT", |value| value >= 0)?;
+            validate_integer(header, "GCOUNT", |value| value >= 0)?;
+            validate_fixed_integer(header, "PCOUNT")?;
+            validate_fixed_integer(header, "GCOUNT")?;
+        }
     } else {
         if keywords.contains(&"SIMPLE") {
             return Err(FitsError::InvalidKeywordOrder {
@@ -718,6 +733,9 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
     validate_reserved_keywords(header, primary)?;
     validate_array_keywords(header, primary)?;
     validate_extension_and_integrity_keywords(header, primary)?;
+    if random_groups {
+        validate_random_groups_keywords(header, naxis)?;
+    }
     validate_integer(header, "BITPIX", |value| {
         matches!(value, 8 | 16 | 32 | 64 | -32 | -64)
     })?;
@@ -725,6 +743,12 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
     for axis in 1..=naxis {
         validate_integer(header, &format!("NAXIS{axis}"), |value| value >= 0)?;
         validate_fixed_integer(header, &format!("NAXIS{axis}"))?;
+    }
+    if random_groups && header.value("NAXIS1") != Some("0") {
+        return Err(FitsError::InvalidMandatoryValue {
+            keyword: "NAXIS1".to_string(),
+            value: header.value("NAXIS1").unwrap_or("missing").to_string(),
+        });
     }
     if primary {
         validate_fixed_integer(header, "NAXIS")?;
@@ -774,6 +798,62 @@ fn validate_reserved_keywords(header: &Header, primary: bool) -> Result<(), Fits
                 }
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_random_groups_keywords(header: &Header, naxis: usize) -> Result<(), FitsError> {
+    if naxis < 2 {
+        return Err(FitsError::InvalidMandatoryValue {
+            keyword: "NAXIS".to_string(),
+            value: naxis.to_string(),
+        });
+    }
+    let parameter_count = header
+        .value("PCOUNT")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    for card in &header.cards {
+        let prefix = card.keyword.get(..5).unwrap_or("");
+        let suffix = card.keyword.get(5..).unwrap_or("");
+        if !matches!(prefix, "PTYPE" | "PSCAL" | "PZERO") {
+            continue;
+        }
+        let Ok(index) = suffix.parse::<usize>() else {
+            return Err(FitsError::InvalidReservedValue {
+                keyword: card.keyword.clone(),
+                value: "invalid random-groups parameter index".to_string(),
+            });
+        };
+        if index == 0 || index > parameter_count {
+            return Err(FitsError::InvalidReservedPlacement {
+                keyword: card.keyword.clone(),
+            });
+        }
+        match prefix {
+            "PTYPE" => validate_string(header, &card.keyword)?,
+            "PSCAL" | "PZERO" => {
+                if !is_real_value(header, &card.keyword) {
+                    return Err(FitsError::InvalidReservedValue {
+                        keyword: card.keyword.clone(),
+                        value: "expected a floating-point value".to_string(),
+                    });
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    for index in 1..=parameter_count {
+        let pscale = format!("PSCAL{index}");
+        let pzero = format!("PZERO{index}");
+        if header.cards.iter().any(|card| card.keyword == pscale)
+            != header.cards.iter().any(|card| card.keyword == pzero)
+        {
+            return Err(FitsError::InvalidReservedValue {
+                keyword: pscale,
+                value: "PSCALn and PZEROn must be used together".to_string(),
+            });
         }
     }
     Ok(())
@@ -1143,6 +1223,27 @@ fn validate_fixed_string(
 fn data_size(header: &Header, primary: bool) -> Result<usize, FitsError> {
     if !primary && extension_type(header).is_none() {
         return Err(FitsError::MissingExtensionType);
+    }
+    if primary && header.value("GROUPS") == Some("T") {
+        let axes = keyword_usize(header, "NAXIS")?;
+        let mut elements_per_group = 1;
+        for axis in 2..=axes {
+            elements_per_group = checked_mul(
+                elements_per_group,
+                keyword_usize(header, &format!("NAXIS{axis}"))?,
+                "NAXIS",
+            )?;
+        }
+        let group_values = checked_add(
+            keyword_usize(header, "PCOUNT")?,
+            elements_per_group,
+            "PCOUNT/NAXIS",
+        )?;
+        return checked_mul(
+            checked_mul(group_values, keyword_usize(header, "GCOUNT")?, "GCOUNT")?,
+            bytes_per_value(header)?,
+            "BITPIX/GCOUNT",
+        );
     }
     let axes = axis_product(header)?;
     let array_bytes = checked_mul(axes, bytes_per_value(header)?, "BITPIX/NAXIS")?;

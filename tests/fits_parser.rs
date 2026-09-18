@@ -701,3 +701,34 @@ fn streams_big_endian_integer_and_ieee_values() {
         .unwrap();
     assert_eq!(value, Some(DataValue::Float32(1.5)));
 }
+
+#[test]
+fn parses_random_groups_structure() {
+    let mut bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                   16",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    0",
+        "NAXIS2  =                    2",
+        "GROUPS  =                    T",
+        "PCOUNT  =                    1",
+        "GCOUNT  =                    2",
+        "PTYPE1  = 'WEIGHT  '",
+        "PSCAL1  =                  1.0",
+        "PZERO1  =                  0.0",
+        "END",
+    ]);
+    bytes.extend_from_slice(&[0; 12]);
+    bytes.resize(BLOCK_SIZE * 2, 0);
+
+    let file = FitsFile::from_bytes(&bytes).expect("random groups should parse");
+    assert_eq!(file.hdus[0].data.len(), 12);
+    let mut reader = FitsReader::new(Cursor::new(bytes));
+    let index = reader.next_hdu().unwrap().unwrap();
+    let groups = index
+        .random_groups()
+        .expect("groups descriptor should exist");
+    assert_eq!(groups.parameter_count, 1);
+    assert_eq!(groups.group_count, 2);
+    assert_eq!(groups.elements_per_group, 2);
+}

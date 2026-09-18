@@ -37,6 +37,19 @@ pub struct HduIndex {
     pub data_size: usize,
 }
 
+/// The random-groups layout described by FITS 4.0 Section 6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RandomGroupsDescriptor {
+    /// Number of parameter values preceding each group array (`PCOUNT`).
+    pub parameter_count: usize,
+    /// Number of groups in the Data Unit (`GCOUNT`).
+    pub group_count: usize,
+    /// Number of array elements following each group's parameters.
+    pub elements_per_group: usize,
+    /// Binary representation shared by parameters and array elements.
+    pub representation: DataRepresentation,
+}
+
 /// The binary representation selected by `BITPIX` in FITS 5.2 and 5.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataRepresentation {
@@ -90,6 +103,25 @@ impl HduIndex {
     /// Returns the scalar representation implied by this HDU's `BITPIX`.
     pub fn data_representation(&self) -> Option<DataRepresentation> {
         DataRepresentation::from_bitpix(self.header.value("BITPIX")?)
+    }
+
+    /// Returns the random-groups descriptor when this is a random-groups HDU.
+    pub fn random_groups(&self) -> Option<RandomGroupsDescriptor> {
+        if self.header.value("GROUPS") != Some("T") {
+            return None;
+        }
+        let axes = self.header.value("NAXIS")?.parse::<usize>().ok()?;
+        let elements_per_group = (2..=axes)
+            .map(|axis| self.header.value(&format!("NAXIS{axis}"))?.parse().ok())
+            .collect::<Option<Vec<usize>>>()?
+            .into_iter()
+            .product();
+        Some(RandomGroupsDescriptor {
+            parameter_count: self.header.value("PCOUNT")?.parse().ok()?,
+            group_count: self.header.value("GCOUNT")?.parse().ok()?,
+            elements_per_group,
+            representation: self.data_representation()?,
+        })
     }
 }
 
