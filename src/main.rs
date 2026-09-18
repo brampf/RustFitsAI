@@ -83,6 +83,6 @@ fn run(arguments: Vec<String>) -> io::Result<()> {
 fn print_help() {
     println!("usage: rustfitsai [-v|--verbose] [-lax|--lax] <input> [output]");
     println!(
-        "\nReads and parses FITS HDUs. Verbose mode prints every logical 80-character header card. Lax mode skips DATASUM/CHECKSUM validation. If output is supplied, the original bytes are also written there."
+        "\nReads and parses FITS HDUs. Verbose mode prints every logical 80-character header card. Lax mode skips DATASUM/CHECKSUM validation and accumulation. If output is supplied, the original bytes are also written there."
     );
 }

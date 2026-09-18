@@ -44,7 +44,9 @@ impl<R: Read> FitsReader<R> {
         }
     }
 
-    /// Creates a reader with optional DATASUM/CHECKSUM validation disabled.
+    /// Creates a reader with optional `DATASUM`/`CHECKSUM` validation disabled.
+    /// Lax mode also skips checksum accumulation, but structural and keyword
+    /// validation remains active.
     pub fn with_lax(reader: R, lax_checksums: bool) -> Self {
         let mut result = Self::new(reader);
         result.lax_checksums = lax_checksums;
@@ -98,6 +100,8 @@ impl<R: Read> FitsReader<R> {
     ///
     /// This is the preferred method for very large Data Units. FITS padding is
     /// defined by the 2880-byte blocking rules in Sections 3.1, 3.2, and 3.6.
+    /// In strict mode the streamed bytes and padding also feed `DATASUM` and
+    /// `CHECKSUM` validation; lax mode avoids that additional CPU work.
     pub fn read_data_to<W: Write>(&mut self, mut writer: W) -> Result<(), FitsError> {
         let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
         let padding = pending.padded_size - pending.size;

@@ -5,7 +5,8 @@
 ///
 /// This model corresponds to the ordered primary HDU, conforming extensions,
 /// and optional special records described in FITS 4.0 Sections 3.1, 3.4, and
-/// 3.5. It is intentionally not used by the streaming CLI for large files.
+/// 3.5. It owns all HDU data and is therefore intentionally not used by the
+/// streaming CLI for large files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FitsFile {
     /// The primary HDU followed by extensions in their on-disk order.
@@ -25,12 +26,12 @@ pub struct Hdu {
 
 /// Header-only index returned before a Data Unit is consumed.
 ///
-/// This is the memory-efficient representation used by [`FitsReader`]. The
+/// This is the memory-efficient representation used by [`crate::FitsReader`]. The
 /// `data_size` value is derived from the FITS size keywords specified in
 /// Section 4.4.1; the Data Unit remains in the input stream until requested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HduIndex {
-    /// Parsed header and raw 80-character cards for this HDU.
+    /// Parsed header, raw cards, and checksum input bytes for this HDU.
     pub header: Header,
     /// Number of meaningful Data Unit bytes, excluding FITS block padding.
     pub data_size: usize,
@@ -58,8 +59,9 @@ pub struct Header {
     /// Parsed keyword records, excluding the `END` marker and blank cards.
     pub cards: Vec<Card>,
     /// Exact printable 80-character cards through and including `END`.
+    /// This convenience representation is retained for verbose output.
     pub raw_cards: Vec<String>,
-    /// Exact header bytes, including header padding, used for CHECKSUM checks.
+    /// Exact header bytes, including header padding, used for `CHECKSUM` checks.
     pub raw_bytes: Vec<u8>,
     /// Header length in complete FITS blocks.
     pub header_size: usize,
@@ -115,7 +117,7 @@ impl Header {
     }
 }
 
-/// A parsed FITS value from the value field described in FITS 4.0 Section 4.2.
+/// A parsed FITS value from FITS 4.0 Sections 4.2 and 4.2.2-4.2.6.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     /// A quoted character string, with doubled single quotes decoded.
@@ -135,6 +137,8 @@ pub enum Value {
 }
 
 impl Value {
+    /// Returns the decoded string or lexical representation of the value.
+    /// Undefined values return `None`.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value)
@@ -171,10 +175,13 @@ impl Value {
 }
 
 /// A validated ISO-8601 datetime string stored in a FITS character value.
+/// FITS 4.0 Section 4.2.7 defines this as a semantic string view, not a new
+/// FITS value datatype.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DateTime<'a>(&'a str);
 
 impl<'a> DateTime<'a> {
+    /// Validates and borrows an ISO-8601 date/time string.
     pub fn parse(value: &'a str) -> Option<Self> {
         let (date, time) = value.split_once('T').or_else(|| value.split_once('t'))?;
         let date_parts: Vec<_> = date.split('-').collect();
@@ -242,6 +249,7 @@ impl<'a> DateTime<'a> {
 pub struct UnitString<'a>(&'a str);
 
 impl<'a> UnitString<'a> {
+    /// Validates and borrows a restricted-ASCII unit string.
     pub fn parse(value: &'a str) -> Option<Self> {
         (!value.is_empty() && value.bytes().all(|byte| (32..=126).contains(&byte)))
             .then_some(Self(value))

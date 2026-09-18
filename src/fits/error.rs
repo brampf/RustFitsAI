@@ -6,7 +6,7 @@ use std::fmt;
 /// Errors raised while validating FITS structure or streaming its blocks.
 ///
 /// The structural constraints represented here primarily come from FITS 4.0
-/// Sections 3.1-3.6 and the header keyword rules in Section 4.4.1.
+/// Sections 3.1-3.6 and the header keyword/value rules in Sections 4.1-4.4.2.7.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FitsError {
     Io(String),
