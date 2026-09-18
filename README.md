@@ -2,6 +2,12 @@
 
 A standalone Rust application boilerplate for reading and writing FITS files.
 
+## FITS Format
+
+FITS (Flexible Image Transport System) is a block-based format for storing
+astronomical data in Header and Data Units (HDUs). This implementation is based
+on the current FITS Standard, version 4.0: [FITS Standard 4.0](https://fits.gsfc.nasa.gov/standard40/fits_standard40aa-le.pdf).
+
 The FITS reader parses a file into HDUs. Each HDU contains its parsed header
 cards and its unpadded data bytes. Headers and data are located according to
 the FITS 2880-byte block and 80-byte card rules. Primary HDUs, standard image
@@ -10,6 +16,14 @@ Extension data sizes use the FITS `BITPIX`, `NAXISn`, `PCOUNT`, and `GCOUNT`
 keywords. Trailing non-extension blocks are preserved as raw
 `FitsFile::special_records`, one 2880-byte block per entry, and their first
 eight bytes are validated not to contain `XTENSION`.
+
+For large files, use the streaming `FitsReader`: `next_hdu()` reads only the
+header as an index, while `read_data_to()` streams the corresponding Data Unit
+to a writer and `skip_data()` discards it without allocating the full Data Unit.
+The `read_data()` method is available when an in-memory Data Unit is explicitly
+needed. `FitsFile::from_bytes()` remains a convenience API for already-loaded
+byte slices. The streaming reader treats an incomplete trailing physical block
+after the last complete FITS structure as media padding and discards it.
 
 ## Usage
 

@@ -3,7 +3,7 @@
 
 use std::{env, fs, io, path::PathBuf, process};
 
-use rustfitsai::FitsFile;
+use rustfitsai::FitsReader;
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -37,27 +37,41 @@ fn run(arguments: Vec<String>) -> io::Result<()> {
     }
 
     let input = PathBuf::from(positional[0]);
-    let contents = fs::read(&input)?;
-    let fits = FitsFile::from_bytes(&contents)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    println!("Parsed {} HDU(s) from {}", fits.hdus.len(), input.display());
-    for (index, hdu) in fits.hdus.iter().enumerate() {
-        let extension = hdu.extension_type().map_or("PRIMARY", |name| name);
+    let file = fs::File::open(&input)?;
+    let mut reader = FitsReader::new(file);
+    let mut hdu_count = 0;
+    while let Some(index) = reader
+        .next_hdu()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+    {
+        let extension = index
+            .header
+            .value("XTENSION")
+            .map(|value| value.trim_matches('\'').trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("PRIMARY");
         println!(
-            "  HDU {index} ({extension}): {} header bytes, {} data bytes",
-            hdu.header.header_size,
-            hdu.data.len()
+            "  HDU {hdu_count} ({extension}): {} header bytes, {} data bytes",
+            index.header.header_size, index.data_size
         );
         if verbose {
-            for line in &hdu.header.raw_cards {
+            for line in &index.header.raw_cards {
                 println!("    {line}");
             }
         }
+        reader
+            .skip_data()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        hdu_count += 1;
     }
-    println!("  Special records: {} block(s)", fits.special_records.len());
+    let special_records = reader
+        .copy_special_records_to(io::sink())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    println!("Parsed {hdu_count} HDU(s) from {}", input.display());
+    println!("  Special records: {special_records} block(s)");
 
     if let Some(output) = positional.get(1) {
-        fs::write(output, contents)?;
+        fs::copy(&input, output)?;
         println!("Copied {} to {}", input.display(), output);
     }
     Ok(())

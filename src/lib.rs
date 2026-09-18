@@ -3,4 +3,6 @@
 
 pub mod fits;
 
-pub use fits::{BLOCK_SIZE, CARD_SIZE, Card, FitsError, FitsFile, Hdu, Header};
+pub use fits::{
+    BLOCK_SIZE, CARD_SIZE, Card, FitsError, FitsFile, FitsReader, Hdu, HduIndex, Header,
+};

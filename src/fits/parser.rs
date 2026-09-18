@@ -1,10 +1,124 @@
 // Copyright (c) 2026 May
 // SPDX-License-Identifier: MIT
 
-use super::{Card, FitsError, FitsFile, Hdu, Header};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+
+use super::{Card, FitsError, FitsFile, Hdu, HduIndex, Header};
 
 pub const BLOCK_SIZE: usize = 2880;
 pub const CARD_SIZE: usize = 80;
+const IO_BUFFER_SIZE: usize = 64 * 1024;
+
+pub struct FitsReader<R> {
+    reader: BufReader<R>,
+    first_hdu: bool,
+    pending_data: Option<PendingData>,
+    at_special_records: bool,
+}
+
+struct PendingData {
+    size: usize,
+    padded_size: usize,
+}
+
+impl<R: Read> FitsReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::with_capacity(IO_BUFFER_SIZE, reader),
+            first_hdu: true,
+            pending_data: None,
+            at_special_records: false,
+        }
+    }
+
+    pub fn next_hdu(&mut self) -> Result<Option<HduIndex>, FitsError> {
+        if self.pending_data.is_some() {
+            return Err(FitsError::DataPending);
+        }
+        if self.at_special_records {
+            return Ok(None);
+        }
+
+        if !self.first_hdu {
+            let prefix = self.reader.fill_buf().map_err(io_error)?;
+            if prefix.is_empty() || prefix.len() < 8 || &prefix[..8] != b"XTENSION" {
+                self.at_special_records = true;
+                return Ok(None);
+            }
+        }
+
+        let header = parse_header(&mut self.reader)?;
+        let data_size = data_size(&header, self.first_hdu)?;
+        let padded_size = padded_size(data_size)?;
+        self.pending_data = Some(PendingData {
+            size: data_size,
+            padded_size,
+        });
+        self.first_hdu = false;
+
+        Ok(Some(HduIndex { header, data_size }))
+    }
+
+    pub fn read_data_to<W: Write>(&mut self, mut writer: W) -> Result<(), FitsError> {
+        let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
+        let padding = pending.padded_size - pending.size;
+        copy_exact(&mut self.reader, &mut writer, pending.size)?;
+        discard_exact(&mut self.reader, padding)?;
+        Ok(())
+    }
+
+    pub fn read_data(&mut self) -> Result<Vec<u8>, FitsError> {
+        let size = self
+            .pending_data
+            .as_ref()
+            .ok_or(FitsError::NoPendingData)?
+            .size;
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|_| FitsError::SizeOverflow {
+                keyword: "data allocation".to_string(),
+            })?;
+        self.read_data_to(&mut data)?;
+        Ok(data)
+    }
+
+    pub fn skip_data(&mut self) -> Result<(), FitsError> {
+        self.read_data_to(io::sink())
+    }
+
+    pub fn read_special_records(&mut self) -> Result<Vec<Vec<u8>>, FitsError> {
+        let mut bytes = Vec::new();
+        self.copy_special_records_to(&mut bytes)?;
+        Ok(bytes.chunks_exact(BLOCK_SIZE).map(Vec::from).collect())
+    }
+
+    pub fn copy_special_records_to<W: Write>(&mut self, mut writer: W) -> Result<usize, FitsError> {
+        if !self.at_special_records {
+            return Err(FitsError::SpecialRecordsNotReady);
+        }
+
+        let mut record = [0_u8; BLOCK_SIZE];
+        let mut count = 0;
+        loop {
+            let mut filled = 0;
+            while filled < BLOCK_SIZE {
+                let bytes_read = self.reader.read(&mut record[filled..]).map_err(io_error)?;
+                if bytes_read == 0 {
+                    return Ok(count);
+                }
+                filled += bytes_read;
+            }
+            if &record[..8] == b"XTENSION" {
+                return Err(FitsError::InvalidSpecialRecords {
+                    offset: count * BLOCK_SIZE,
+                    message: "the first eight bytes must not contain XTENSION".to_string(),
+                });
+            }
+            writer.write_all(&record).map_err(io_error)?;
+            count += 1;
+        }
+    }
+}
 
 impl FitsFile {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FitsError> {
@@ -12,44 +126,16 @@ impl FitsFile {
             return Err(FitsError::EmptyFile);
         }
 
+        let mut reader = FitsReader::new(Cursor::new(bytes));
         let mut hdus = Vec::new();
-        let mut offset = 0;
-        let (header, header_end) = parse_header(bytes, offset)?;
-        let primary_data_size = data_size(&header, true)?;
-        let padded_data_size = padded_size(primary_data_size)?;
-        let data_end = checked_add(header_end, padded_data_size, "data size")?;
-        if data_end > bytes.len() {
-            return Err(FitsError::Truncated {
-                offset: header_end,
-                expected: data_end - bytes.len(),
-            });
-        }
-        hdus.push(Hdu {
-            header,
-            data: bytes[header_end..header_end + primary_data_size].to_vec(),
-        });
-        offset = data_end;
-
-        while offset < bytes.len() && starts_extension(bytes, offset) {
-            let (header, header_end) = parse_header(bytes, offset)?;
-            let data_size = data_size(&header, false)?;
-            let padded_data_size = padded_size(data_size)?;
-            let data_end = checked_add(header_end, padded_data_size, "data size")?;
-            if data_end > bytes.len() {
-                return Err(FitsError::Truncated {
-                    offset: header_end,
-                    expected: data_end - bytes.len(),
-                });
-            }
-
+        while let Some(index) = reader.next_hdu()? {
+            let data = reader.read_data()?;
             hdus.push(Hdu {
-                header,
-                data: bytes[header_end..header_end + data_size].to_vec(),
+                header: index.header,
+                data,
             });
-            offset = data_end;
         }
-
-        let special_records = parse_special_records(bytes, offset)?;
+        let special_records = reader.read_special_records()?;
         Ok(Self {
             hdus,
             special_records,
@@ -57,62 +143,20 @@ impl FitsFile {
     }
 }
 
-fn starts_extension(bytes: &[u8], offset: usize) -> bool {
-    if bytes.len() - offset < 8 {
-        return false;
-    }
-    bytes[offset..offset + 8]
-        .windows(8)
-        .any(|window| window == b"XTENSION")
-}
-
-fn parse_special_records(bytes: &[u8], offset: usize) -> Result<Vec<Vec<u8>>, FitsError> {
-    if offset == bytes.len() {
-        return Ok(Vec::new());
-    }
-    if (bytes.len() - offset) % BLOCK_SIZE != 0 {
-        return Err(FitsError::InvalidSpecialRecords {
-            offset,
-            message: "records must contain whole 2880-byte blocks".to_string(),
-        });
-    }
-
-    let mut records = Vec::new();
-    for (index, record) in bytes[offset..].chunks_exact(BLOCK_SIZE).enumerate() {
-        if record[..8].windows(8).any(|window| window == b"XTENSION") {
-            return Err(FitsError::InvalidSpecialRecords {
-                offset: offset + index * BLOCK_SIZE,
-                message: "the first eight bytes must not contain XTENSION".to_string(),
-            });
-        }
-        records.push(record.to_vec());
-    }
-    Ok(records)
-}
-
-fn parse_header(bytes: &[u8], offset: usize) -> Result<(Header, usize), FitsError> {
+fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
     let mut cards = Vec::new();
     let mut raw_cards = Vec::new();
-    let mut cursor = offset;
+    let mut header_size = 0;
+    let mut block = [0_u8; BLOCK_SIZE];
 
     loop {
-        let block_end = cursor
-            .checked_add(BLOCK_SIZE)
-            .ok_or_else(|| FitsError::SizeOverflow {
-                keyword: "header size".to_string(),
-            })?;
-        if block_end > bytes.len() {
-            return Err(FitsError::Truncated {
-                offset: cursor,
-                expected: block_end - bytes.len(),
-            });
-        }
-
+        reader.read_exact(&mut block).map_err(io_error)?;
+        header_size += BLOCK_SIZE;
         let mut found_end = false;
-        for card_bytes in bytes[cursor..block_end].chunks_exact(CARD_SIZE) {
+        for card_bytes in block.chunks_exact(CARD_SIZE) {
             if card_bytes.iter().any(|byte| !(32..=126).contains(byte)) {
                 return Err(FitsError::InvalidHeader {
-                    offset: cursor,
+                    offset: header_size - BLOCK_SIZE,
                     message: "header contains a non-ASCII printable character".to_string(),
                 });
             }
@@ -126,23 +170,46 @@ fn parse_header(bytes: &[u8], offset: usize) -> Result<(Header, usize), FitsErro
                 continue;
             }
             if card_bytes[8] != b'=' && keyword != "COMMENT" && keyword != "HISTORY" {
-                return Err(FitsError::InvalidKeyword { offset: cursor });
+                return Err(FitsError::InvalidKeyword {
+                    offset: header_size - BLOCK_SIZE,
+                });
             }
             cards.push(parse_card(card_bytes));
         }
-
-        cursor = block_end;
         if found_end {
-            return Ok((
-                Header {
-                    cards,
-                    raw_cards,
-                    header_size: cursor - offset,
-                },
-                cursor,
-            ));
+            return Ok(Header {
+                cards,
+                raw_cards,
+                header_size,
+            });
         }
     }
+}
+
+fn copy_exact<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    size: usize,
+) -> Result<(), FitsError> {
+    let mut remaining = size;
+    let mut buffer = [0_u8; IO_BUFFER_SIZE];
+    while remaining > 0 {
+        let requested = remaining.min(buffer.len());
+        reader
+            .read_exact(&mut buffer[..requested])
+            .map_err(io_error)?;
+        writer.write_all(&buffer[..requested]).map_err(io_error)?;
+        remaining -= requested;
+    }
+    Ok(())
+}
+
+fn discard_exact<R: Read>(reader: &mut R, size: usize) -> Result<(), FitsError> {
+    copy_exact(reader, &mut io::sink(), size)
+}
+
+fn io_error(error: io::Error) -> FitsError {
+    FitsError::Io(error.to_string())
 }
 
 fn parse_card(card: &[u8]) -> Card {
@@ -185,7 +252,6 @@ fn data_size(header: &Header, primary: bool) -> Result<usize, FitsError> {
     if !primary && extension_type(header).is_none() {
         return Err(FitsError::MissingExtensionType);
     }
-
     let axes = axis_product(header)?;
     let array_bytes = checked_mul(axes, bytes_per_value(header)?, "BITPIX/NAXIS")?;
     let with_parameters = checked_add(

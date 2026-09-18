@@ -1,7 +1,9 @@
 // Copyright (c) 2026 May
 // SPDX-License-Identifier: MIT
 
-use rustfitsai::{BLOCK_SIZE, FitsError, FitsFile};
+use std::io::Cursor;
+
+use rustfitsai::{BLOCK_SIZE, FitsError, FitsFile, FitsReader};
 
 fn card(text: &str) -> [u8; 80] {
     let mut result = [b' '; 80];
@@ -106,7 +108,7 @@ fn preserves_special_records_after_last_hdu() {
 }
 
 #[test]
-fn rejects_partial_special_record() {
+fn ignores_partial_physical_tail_after_special_records() {
     let mut bytes = header(&[
         "SIMPLE  =                    T",
         "BITPIX  =                    8",
@@ -115,10 +117,8 @@ fn rejects_partial_special_record() {
     ]);
     bytes.extend_from_slice(b"partial");
 
-    assert!(matches!(
-        FitsFile::from_bytes(&bytes),
-        Err(FitsError::InvalidSpecialRecords { .. })
-    ));
+    let file = FitsFile::from_bytes(&bytes).expect("physical tail should be ignored");
+    assert!(file.special_records.is_empty());
 }
 
 #[test]
@@ -137,4 +137,32 @@ fn rejects_xtension_in_special_record_prefix() {
         FitsFile::from_bytes(&bytes),
         Err(FitsError::InvalidKeyword { .. }) | Err(FitsError::InvalidSpecialRecords { .. })
     ));
+}
+
+#[test]
+fn streams_data_only_when_requested() {
+    let mut bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    1",
+        "NAXIS1  =                    6",
+        "END",
+    ]);
+    bytes.extend_from_slice(b"stream");
+    bytes.resize(BLOCK_SIZE * 2, 0);
+
+    let mut reader = FitsReader::new(Cursor::new(bytes));
+    let index = reader
+        .next_hdu()
+        .expect("header should parse")
+        .expect("primary HDU should exist");
+    assert_eq!(index.data_size, 6);
+    assert!(matches!(reader.next_hdu(), Err(FitsError::DataPending)));
+
+    let mut streamed = Vec::new();
+    reader
+        .read_data_to(&mut streamed)
+        .expect("data should stream to the writer");
+    assert_eq!(streamed, b"stream");
+    assert!(reader.next_hdu().expect("end should be readable").is_none());
 }

@@ -5,6 +5,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FitsError {
+    Io(String),
     EmptyFile,
     Truncated { offset: usize, expected: usize },
     InvalidHeader { offset: usize, message: String },
@@ -12,12 +13,16 @@ pub enum FitsError {
     InvalidValue { keyword: String, value: String },
     MissingExtensionType,
     InvalidSpecialRecords { offset: usize, message: String },
+    DataPending,
+    NoPendingData,
+    SpecialRecordsNotReady,
     SizeOverflow { keyword: String },
 }
 
 impl fmt::Display for FitsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Io(error) => write!(formatter, "I/O error while reading FITS data: {error}"),
             Self::EmptyFile => write!(formatter, "FITS file is empty"),
             Self::Truncated { offset, expected } => write!(
                 formatter,
@@ -39,6 +44,14 @@ impl fmt::Display for FitsError {
                 write!(
                     formatter,
                     "invalid special records at byte {offset}: {message}"
+                )
+            }
+            Self::DataPending => write!(formatter, "the current HDU data must be consumed first"),
+            Self::NoPendingData => write!(formatter, "no HDU data is available to read"),
+            Self::SpecialRecordsNotReady => {
+                write!(
+                    formatter,
+                    "the reader has not reached the special-record section"
                 )
             }
             Self::SizeOverflow { keyword } => {

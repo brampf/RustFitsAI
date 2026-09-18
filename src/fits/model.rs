@@ -13,6 +13,12 @@ pub struct Hdu {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HduIndex {
+    pub header: Header,
+    pub data_size: usize,
+}
+
 impl Hdu {
     pub fn extension_type(&self) -> Option<&str> {
         self.header

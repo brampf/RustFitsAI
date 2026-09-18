@@ -6,5 +6,5 @@ mod model;
 mod parser;
 
 pub use error::FitsError;
-pub use model::{Card, FitsFile, Hdu, Header};
-pub use parser::{BLOCK_SIZE, CARD_SIZE};
+pub use model::{Card, FitsFile, Hdu, HduIndex, Header};
+pub use parser::{BLOCK_SIZE, CARD_SIZE, FitsReader};
