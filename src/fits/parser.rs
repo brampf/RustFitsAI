@@ -3,7 +3,7 @@
 
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
-use super::{Card, FitsError, FitsFile, Hdu, HduIndex, Header};
+use super::{Card, FitsError, FitsFile, Hdu, HduIndex, Header, Value};
 
 /// Logical FITS block size from FITS 4.0 Sections 3.1-3.3.
 pub const BLOCK_SIZE: usize = 2880;
@@ -260,10 +260,23 @@ fn keyword_name(field: &[u8]) -> Result<String, FitsError> {
 
 fn parse_card(card: &[u8], keyword: String) -> Result<Card, FitsError> {
     let has_value_indicator = &card[8..10] == b"= ";
+    if keyword == "CONTINUE" && has_value_indicator {
+        return Err(FitsError::InvalidValueIndicator { keyword });
+    }
     if card[8] == b'=' && !has_value_indicator {
         return Err(FitsError::InvalidValueIndicator { keyword });
     }
     if !has_value_indicator || keyword == "COMMENT" || keyword == "HISTORY" {
+        if keyword == "CONTINUE" && !has_value_indicator {
+            let field = String::from_utf8_lossy(&card[10..]);
+            if let Some((value, comment)) = parse_string_value(&field, &keyword)? {
+                return Ok(Card {
+                    keyword,
+                    value: Some(Value::String(value)),
+                    comment,
+                });
+            }
+        }
         let start = if has_value_indicator { 10 } else { 8 };
         let text = String::from_utf8_lossy(&card[start..]).trim().to_string();
         return Ok(Card {
@@ -274,11 +287,132 @@ fn parse_card(card: &[u8], keyword: String) -> Result<Card, FitsError> {
     }
 
     let field = String::from_utf8_lossy(&card[10..]);
-    let (value, comment) = split_value_comment(&field);
+    let Some((value, comment)) = parse_string_value(&field, &keyword)? else {
+        let (value, comment) = split_value_comment(&field);
+        let trimmed = value.trim();
+        let value = if trimmed.is_empty() {
+            Value::Undefined
+        } else {
+            classify_scalar(trimmed, &keyword)?
+        };
+        return Ok(Card {
+            keyword,
+            value: Some(value),
+            comment,
+        });
+    };
     Ok(Card {
         keyword,
-        value: Some(value.trim().to_string()),
+        value: Some(Value::String(value)),
         comment,
+    })
+}
+
+fn classify_scalar(value: &str, keyword: &str) -> Result<Value, FitsError> {
+    if value == "T" || value == "F" {
+        return Ok(Value::Logical(value.to_string()));
+    }
+    if is_integer(value) {
+        return Ok(Value::Integer(value.to_string()));
+    }
+    if is_real(value) {
+        return Ok(Value::Real(value.to_string()));
+    }
+    if let Some((real, imaginary)) = parse_complex(value, is_integer) {
+        return Ok(Value::ComplexInteger(format!("({real}, {imaginary})")));
+    }
+    if let Some((real, imaginary)) = parse_complex(value, is_real) {
+        return Ok(Value::ComplexReal(format!("({real}, {imaginary})")));
+    }
+    Err(FitsError::InvalidValue {
+        keyword: keyword.to_string(),
+        value: value.to_string(),
+    })
+}
+
+fn is_integer(value: &str) -> bool {
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_real(value: &str) -> bool {
+    let value = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let (mantissa, exponent) = value
+        .split_once(['E', 'D'])
+        .map_or((value, None), |(mantissa, exponent)| {
+            (mantissa, Some(exponent))
+        });
+    if let Some(exponent) = exponent {
+        if !is_integer(exponent) {
+            return false;
+        }
+    }
+    if let Some((integer, fraction)) = mantissa.split_once('.') {
+        return (!integer.is_empty() || !fraction.is_empty())
+            && integer.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    exponent.is_some() && !mantissa.is_empty() && mantissa.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parse_complex<F>(value: &str, component_is_valid: F) -> Option<(&str, &str)>
+where
+    F: Fn(&str) -> bool,
+{
+    let inner = value.strip_prefix('(')?.strip_suffix(')')?;
+    let (real, imaginary) = inner.split_once(',')?;
+    let real = real.trim();
+    let imaginary = imaginary.trim();
+    component_is_valid(real)
+        .then_some((real, imaginary))
+        .filter(|(_, imaginary)| component_is_valid(imaginary))
+}
+
+fn parse_string_value(
+    field: &str,
+    keyword: &str,
+) -> Result<Option<(String, Option<String>)>, FitsError> {
+    let leading = field.len() - field.trim_start_matches(' ').len();
+    let value_field = &field[leading..];
+    if !value_field.starts_with('\'') {
+        return Ok(None);
+    }
+
+    let bytes = value_field.as_bytes();
+    let mut index = 1;
+    let mut value = String::new();
+    while index < bytes.len() {
+        if bytes[index] != b'\'' {
+            value.push(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+            value.push('\'');
+            index += 2;
+        } else {
+            let remainder = &value_field[index + 1..];
+            let comment = parse_comment_suffix(remainder, keyword)?;
+            return Ok(Some((value, comment)));
+        }
+    }
+    Err(FitsError::InvalidValue {
+        keyword: keyword.to_string(),
+        value: "unterminated character string".to_string(),
+    })
+}
+
+fn parse_comment_suffix(suffix: &str, keyword: &str) -> Result<Option<String>, FitsError> {
+    let suffix = suffix.trim_start_matches(' ');
+    if suffix.is_empty() {
+        return Ok(None);
+    }
+    if let Some(comment) = suffix.strip_prefix('/') {
+        return Ok(Some(comment.trim().to_string()));
+    }
+    Err(FitsError::InvalidValue {
+        keyword: keyword.to_string(),
+        value: "characters after closing quote must be spaces or a comment".to_string(),
     })
 }
 

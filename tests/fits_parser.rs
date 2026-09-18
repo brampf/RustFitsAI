@@ -3,7 +3,7 @@
 
 use std::io::Cursor;
 
-use rustfitsai::{BLOCK_SIZE, FitsError, FitsFile, FitsReader};
+use rustfitsai::{BLOCK_SIZE, FitsError, FitsFile, FitsReader, Value};
 
 fn card(text: &str) -> [u8; 80] {
     let mut result = [b' '; 80];
@@ -209,4 +209,124 @@ fn requires_space_after_value_indicator() {
         FitsFile::from_bytes(&bytes),
         Err(FitsError::InvalidValueIndicator { keyword }) if keyword == "SIMPLE"
     ));
+}
+
+#[test]
+fn parses_string_values_and_distinguishes_undefined_values() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "STRKEY  = 'O''HARA  ' / a string",
+        "NULLKEY =                    / undefined",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    let file = FitsFile::from_bytes(&bytes).expect("string values should parse");
+    let cards = &file.hdus[0].header.cards;
+    assert_eq!(file.hdus[0].header.value("STRKEY"), Some("O'HARA  "));
+    assert_eq!(cards[2].value, Some(Value::String("O'HARA  ".to_string())));
+    assert_eq!(cards[3].value, Some(Value::Undefined));
+}
+
+#[test]
+fn reconstructs_continue_string_values() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "LONGKEY = 'first part&'",
+        "CONTINUE  'second part&'",
+        "CONTINUE  'last part'",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    let file = FitsFile::from_bytes(&bytes).expect("continued strings should parse");
+    assert_eq!(
+        file.hdus[0].header.string_value("LONGKEY").as_deref(),
+        Some("first partsecond partlast part")
+    );
+}
+
+#[test]
+fn rejects_unterminated_string_values() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "STRKEY  = 'unterminated",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidValue { keyword, .. }) if keyword == "STRKEY"
+    ));
+}
+
+#[test]
+fn classifies_logical_numeric_and_complex_values() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                   16",
+        "LOGICAL =                    F",
+        "INTEGER =                  +007",
+        "REALNUM =              -1.2E+3",
+        "REALINT =                 1E3",
+        "CINT    =              (12,-4)",
+        "CREAL   =          (1.5, -2.0)",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    let file = FitsFile::from_bytes(&bytes).expect("scalar values should parse");
+    let header = &file.hdus[0].header;
+    assert_eq!(header.cards[2].value, Some(Value::Logical("F".to_string())));
+    assert_eq!(
+        header.cards[3].value,
+        Some(Value::Integer("+007".to_string()))
+    );
+    assert_eq!(
+        header.cards[4].value,
+        Some(Value::Real("-1.2E+3".to_string()))
+    );
+    assert_eq!(header.cards[5].value, Some(Value::Real("1E3".to_string())));
+    assert_eq!(
+        header.cards[6].value,
+        Some(Value::ComplexInteger("(12, -4)".to_string()))
+    );
+    assert_eq!(
+        header.cards[7].value,
+        Some(Value::ComplexReal("(1.5, -2.0)".to_string()))
+    );
+}
+
+#[test]
+fn validates_datetime_and_unit_string_views() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "DATEKEY = '2026-09-19T12:34:56Z'",
+        "BUNIT   = 'W m-2 Hz-1'",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    let file = FitsFile::from_bytes(&bytes).expect("datetime and unit strings should parse");
+    let header = &file.hdus[0].header;
+    let date = header.cards[2]
+        .value
+        .as_ref()
+        .unwrap()
+        .as_datetime()
+        .unwrap();
+    let unit = header.cards[3].value.as_ref().unwrap().as_unit().unwrap();
+    assert_eq!(date.as_str(), "2026-09-19T12:34:56Z");
+    assert_eq!(unit.as_str(), "W m-2 Hz-1");
+}
+
+#[test]
+fn rejects_invalid_datetime_and_control_character_units() {
+    assert!(rustfitsai::DateTime::parse("2026-09-19 12:34:56Z").is_none());
+    assert!(rustfitsai::UnitString::parse("m\n").is_none());
 }

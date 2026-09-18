@@ -4,5 +4,6 @@
 pub mod fits;
 
 pub use fits::{
-    BLOCK_SIZE, CARD_SIZE, Card, FitsError, FitsFile, FitsReader, Hdu, HduIndex, Header,
+    BLOCK_SIZE, CARD_SIZE, Card, DateTime, FitsError, FitsFile, FitsReader, Hdu, HduIndex, Header,
+    UnitString, Value,
 };

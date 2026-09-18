@@ -71,7 +71,182 @@ impl Header {
         self.cards
             .iter()
             .find(|card| card.keyword == keyword)
-            .and_then(|card| card.value.as_deref())
+            .and_then(|card| card.value.as_ref())
+            .and_then(Value::as_str)
+    }
+
+    /// Reconstructs a single-record or `CONTINUE`-extended string value.
+    ///
+    /// This follows FITS 4.0 Section 4.2.1.2: a trailing `&` is removed only
+    /// when the next card is a conforming `CONTINUE` string record.
+    pub fn string_value(&self, keyword: &str) -> Option<String> {
+        let start = self.cards.iter().position(|card| card.keyword == keyword)?;
+        let mut value = match self.cards[start].value.as_ref()? {
+            Value::String(value) => value.clone(),
+            Value::Logical(_)
+            | Value::Integer(_)
+            | Value::Real(_)
+            | Value::ComplexInteger(_)
+            | Value::ComplexReal(_)
+            | Value::Undefined => return None,
+        };
+        let mut index = start + 1;
+        while value.ends_with('&') {
+            let continuation = self.cards.get(index)?;
+            if continuation.keyword != "CONTINUE" {
+                break;
+            }
+            let part = match continuation.value.as_ref()? {
+                Value::String(part) => part,
+                Value::Logical(_)
+                | Value::Integer(_)
+                | Value::Real(_)
+                | Value::ComplexInteger(_)
+                | Value::ComplexReal(_)
+                | Value::Undefined => break,
+            };
+            value.pop();
+            value.push_str(part);
+            index += 1;
+        }
+        Some(value)
+    }
+}
+
+/// A parsed FITS value from the value field described in FITS 4.0 Section 4.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    /// A quoted character string, with doubled single quotes decoded.
+    String(String),
+    /// An upper-case `T` or `F` logical constant.
+    Logical(String),
+    /// A signed decimal integer, retained lexically to avoid range loss.
+    Integer(String),
+    /// A decimal floating-point value with optional upper-case `E`/`D` exponent.
+    Real(String),
+    /// A parenthesized pair of integer values.
+    ComplexInteger(String),
+    /// A parenthesized pair of real floating-point values.
+    ComplexReal(String),
+    /// A present value indicator with an entirely blank value field.
+    Undefined,
+}
+
+impl Value {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value)
+            | Self::Logical(value)
+            | Self::Integer(value)
+            | Self::Real(value)
+            | Self::ComplexInteger(value)
+            | Self::ComplexReal(value) => Some(value),
+            Self::Undefined => None,
+        }
+    }
+
+    /// Interprets a string value as an ISO-8601 date/time without introducing
+    /// a FITS `Date` value type. FITS 4.0 Sections 4.2.7 and 9.1.1 define
+    /// datetime values as character strings.
+    pub fn as_datetime(&self) -> Option<DateTime<'_>> {
+        let value = match self {
+            Self::String(value) => value,
+            _ => return None,
+        };
+        DateTime::parse(value)
+    }
+
+    /// Interprets a string value as a restricted-ASCII FITS unit string.
+    /// Units are metadata associated with a value, not a separate FITS value
+    /// datatype; see FITS 4.0 Sections 4.3 and 4.3.1.
+    pub fn as_unit(&self) -> Option<UnitString<'_>> {
+        let value = match self {
+            Self::String(value) => value,
+            _ => return None,
+        };
+        UnitString::parse(value)
+    }
+}
+
+/// A validated ISO-8601 datetime string stored in a FITS character value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateTime<'a>(&'a str);
+
+impl<'a> DateTime<'a> {
+    pub fn parse(value: &'a str) -> Option<Self> {
+        let (date, time) = value.split_once('T').or_else(|| value.split_once('t'))?;
+        let date_parts: Vec<_> = date.split('-').collect();
+        if date_parts.len() != 3
+            || date_parts[0].len() != 4
+            || date_parts[1].len() != 2
+            || date_parts[2].len() != 2
+            || !date_parts
+                .iter()
+                .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return None;
+        }
+
+        let (clock, timezone) =
+            if let Some(clock) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
+                (clock, "Z")
+            } else if let Some(index) = time.rfind(['+', '-']) {
+                (&time[..index], &time[index..])
+            } else {
+                return None;
+            };
+        let clock_parts: Vec<_> = clock.split(':').collect();
+        if clock_parts.len() != 3
+            || clock_parts[0].len() != 2
+            || clock_parts[1].len() != 2
+            || !clock_parts[0..2]
+                .iter()
+                .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return None;
+        }
+        let seconds =
+            clock_parts[2]
+                .split_once('.')
+                .map_or(clock_parts[2], |(seconds, fraction)| {
+                    if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                        ""
+                    } else {
+                        seconds
+                    }
+                });
+        if seconds.len() != 2 || !seconds.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        if timezone != "Z"
+            && (timezone.len() != 6
+                || !matches!(timezone.as_bytes()[0], b'+' | b'-')
+                || timezone.as_bytes()[3] != b':'
+                || !timezone[1..3].bytes().all(|byte| byte.is_ascii_digit())
+                || !timezone[4..].bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return None;
+        }
+        Some(Self(value))
+    }
+
+    pub fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+/// A restricted-ASCII unit string as described by FITS 4.0 Section 4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitString<'a>(&'a str);
+
+impl<'a> UnitString<'a> {
+    pub fn parse(value: &'a str) -> Option<Self> {
+        (!value.is_empty() && value.bytes().all(|byte| (32..=126).contains(&byte)))
+            .then_some(Self(value))
+    }
+
+    pub fn as_str(self) -> &'a str {
+        self.0
     }
 }
 
@@ -83,6 +258,6 @@ impl Header {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
     pub keyword: String,
-    pub value: Option<String>,
+    pub value: Option<Value>,
     pub comment: Option<String>,
 }

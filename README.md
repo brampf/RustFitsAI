@@ -25,6 +25,14 @@ needed. `FitsFile::from_bytes()` remains a convenience API for already-loaded
 byte slices. The streaming reader treats an incomplete trailing physical block
 after the last complete FITS structure as media padding and discards it.
 
+Header Values are exposed as `Value::String`, `Value::Logical`, `Value::Integer`,
+`Value::Real`, `Value::ComplexInteger`, `Value::ComplexReal`, or
+`Value::Undefined`. Quoted strings decode doubled single quotes, and
+`Header::string_value()` reconstructs FITS 4.0 `CONTINUE` long-string records.
+FITS dates are not a separate value datatype: ISO-8601 datetime strings can be
+validated with `Value::as_datetime()`, while physical units can be inspected as
+restricted-ASCII strings with `Value::as_unit()`.
+
 ## Usage
 
 ```text

@@ -11,5 +11,5 @@ mod model;
 mod parser;
 
 pub use error::FitsError;
-pub use model::{Card, FitsFile, Hdu, HduIndex, Header};
+pub use model::{Card, DateTime, FitsFile, Hdu, HduIndex, Header, UnitString, Value};
 pub use parser::{BLOCK_SIZE, CARD_SIZE, FitsReader};
