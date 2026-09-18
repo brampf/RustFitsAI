@@ -59,6 +59,8 @@ pub struct Header {
     pub cards: Vec<Card>,
     /// Exact printable 80-character cards through and including `END`.
     pub raw_cards: Vec<String>,
+    /// Exact header bytes, including header padding, used for CHECKSUM checks.
+    pub raw_bytes: Vec<u8>,
     /// Header length in complete FITS blocks.
     pub header_size: usize,
 }

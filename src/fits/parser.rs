@@ -22,11 +22,14 @@ pub struct FitsReader<R> {
     first_hdu: bool,
     pending_data: Option<PendingData>,
     at_special_records: bool,
+    lax_checksums: bool,
 }
 
 struct PendingData {
     size: usize,
     padded_size: usize,
+    datasum: Option<u32>,
+    checksum_header: Option<Vec<u8>>,
 }
 
 impl<R: Read> FitsReader<R> {
@@ -37,7 +40,15 @@ impl<R: Read> FitsReader<R> {
             first_hdu: true,
             pending_data: None,
             at_special_records: false,
+            lax_checksums: false,
         }
+    }
+
+    /// Creates a reader with optional DATASUM/CHECKSUM validation disabled.
+    pub fn with_lax(reader: R, lax_checksums: bool) -> Self {
+        let mut result = Self::new(reader);
+        result.lax_checksums = lax_checksums;
+        result
     }
 
     /// Parses the next primary or conforming extension header.
@@ -65,9 +76,18 @@ impl<R: Read> FitsReader<R> {
         validate_header(&header, self.first_hdu)?;
         let data_size = data_size(&header, self.first_hdu)?;
         let padded_size = padded_size(data_size)?;
+        let datasum = header
+            .value("DATASUM")
+            .and_then(|value| value.trim().parse().ok());
+        let checksum_header = card_value(&header, "CHECKSUM")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| header.raw_bytes.clone());
         self.pending_data = Some(PendingData {
             size: data_size,
             padded_size,
+            datasum,
+            checksum_header,
         });
         self.first_hdu = false;
 
@@ -81,8 +101,17 @@ impl<R: Read> FitsReader<R> {
     pub fn read_data_to<W: Write>(&mut self, mut writer: W) -> Result<(), FitsError> {
         let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
         let padding = pending.padded_size - pending.size;
-        copy_exact(&mut self.reader, &mut writer, pending.size)?;
-        discard_exact(&mut self.reader, padding)?;
+        if self.lax_checksums {
+            copy_exact(&mut self.reader, &mut writer, pending.size)?;
+            copy_exact(&mut self.reader, &mut io::sink(), padding)?;
+        } else {
+            let mut checksum = OnesComplement::default();
+            copy_exact_checksum(&mut self.reader, &mut writer, pending.size, &mut checksum)?;
+            copy_exact_checksum(&mut self.reader, &mut io::sink(), padding, &mut checksum)?;
+            let data_sum = checksum.finish();
+            validate_data_checksum(pending.datasum, data_sum)?;
+            validate_hdu_checksum(pending.checksum_header.as_deref(), data_sum)?;
+        }
         Ok(())
     }
 
@@ -180,11 +209,13 @@ impl FitsFile {
 fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
     let mut cards = Vec::new();
     let mut raw_cards = Vec::new();
+    let mut raw_bytes = Vec::new();
     let mut header_size = 0;
     let mut block = [0_u8; BLOCK_SIZE];
 
     loop {
         reader.read_exact(&mut block).map_err(io_error)?;
+        raw_bytes.extend_from_slice(&block);
         header_size += BLOCK_SIZE;
         let mut found_end = false;
         for card_bytes in block.chunks_exact(CARD_SIZE) {
@@ -212,10 +243,31 @@ fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
             return Ok(Header {
                 cards,
                 raw_cards,
+                raw_bytes,
                 header_size,
             });
         }
     }
+}
+
+fn copy_exact_checksum<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    size: usize,
+    checksum: &mut OnesComplement,
+) -> Result<(), FitsError> {
+    let mut remaining = size;
+    let mut buffer = [0_u8; IO_BUFFER_SIZE];
+    while remaining > 0 {
+        let requested = remaining.min(buffer.len());
+        reader
+            .read_exact(&mut buffer[..requested])
+            .map_err(io_error)?;
+        checksum.update(&buffer[..requested]);
+        writer.write_all(&buffer[..requested]).map_err(io_error)?;
+        remaining -= requested;
+    }
+    Ok(())
 }
 
 fn copy_exact<R: Read, W: Write>(
@@ -236,8 +288,98 @@ fn copy_exact<R: Read, W: Write>(
     Ok(())
 }
 
-fn discard_exact<R: Read>(reader: &mut R, size: usize) -> Result<(), FitsError> {
-    copy_exact(reader, &mut io::sink(), size)
+#[derive(Default)]
+struct OnesComplement {
+    sum: u64,
+    tail: Vec<u8>,
+}
+
+impl OnesComplement {
+    fn update(&mut self, bytes: &[u8]) {
+        let mut bytes = bytes;
+        if !self.tail.is_empty() {
+            let needed = 4 - self.tail.len();
+            let take = needed.min(bytes.len());
+            self.tail.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.tail.len() == 4 {
+                self.add_word(&self.tail.clone());
+                self.tail.clear();
+            }
+        }
+        for chunk in bytes.chunks_exact(4) {
+            self.add_word(chunk);
+        }
+        self.tail
+            .extend_from_slice(bytes.chunks_exact(4).remainder());
+    }
+
+    fn add_word(&mut self, word: &[u8]) {
+        self.sum += u32::from_be_bytes([word[0], word[1], word[2], word[3]]) as u64;
+        self.fold();
+    }
+
+    fn fold(&mut self) {
+        while self.sum >> 32 != 0 {
+            self.sum = (self.sum & 0xffff_ffff) + (self.sum >> 32);
+        }
+    }
+
+    fn finish(mut self) -> u32 {
+        if !self.tail.is_empty() {
+            let mut word = [0_u8; 4];
+            word[..self.tail.len()].copy_from_slice(&self.tail);
+            self.add_word(&word);
+        }
+        self.fold();
+        self.sum as u32
+    }
+}
+
+fn validate_data_checksum(expected: Option<u32>, actual: u32) -> Result<(), FitsError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected != actual {
+        return Err(FitsError::ChecksumMismatch {
+            keyword: "DATASUM".to_string(),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_hdu_checksum(header_bytes: Option<&[u8]>, data_sum: u32) -> Result<(), FitsError> {
+    let Some(header_bytes) = header_bytes else {
+        return Ok(());
+    };
+    let mut header_sum = OnesComplement::default();
+    let mut header_bytes = header_bytes.to_vec();
+    for card in header_bytes.chunks_exact_mut(CARD_SIZE) {
+        if &card[..8] == b"CHECKSUM" {
+            card[11..27].fill(b'0');
+            break;
+        }
+    }
+    header_sum.update(&header_bytes);
+    let actual = fold_sum(header_sum.finish(), data_sum);
+    if actual != u32::MAX {
+        return Err(FitsError::ChecksumMismatch {
+            keyword: "CHECKSUM".to_string(),
+            expected: "ones-complement negative zero".to_string(),
+            actual: format!("{actual:08X}"),
+        });
+    }
+    Ok(())
+}
+
+fn fold_sum(left: u32, right: u32) -> u32 {
+    let mut sum = left as u64 + right as u64;
+    while sum >> 32 != 0 {
+        sum = (sum & 0xffff_ffff) + (sum >> 32);
+    }
+    sum as u32
 }
 
 fn io_error(error: io::Error) -> FitsError {

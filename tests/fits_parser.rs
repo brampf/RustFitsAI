@@ -617,3 +617,49 @@ fn rejects_misplaced_inherit_and_invalid_checksum_values() {
         Err(FitsError::InvalidIntegrityKeyword { keyword, .. }) if keyword == "CHECKSUM"
     ));
 }
+
+#[test]
+fn validates_datasum_and_lax_mode_skips_checksum_errors() {
+    let mut bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    1",
+        "NAXIS1  =                    3",
+        "DATASUM = '0'",
+        "END",
+    ]);
+    bytes.extend_from_slice(b"abc");
+    bytes.resize(BLOCK_SIZE * 2, 0);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::ChecksumMismatch { keyword, .. }) if keyword == "DATASUM"
+    ));
+
+    let mut reader = FitsReader::with_lax(Cursor::new(bytes), true);
+    let index = reader
+        .next_hdu()
+        .expect("header should parse")
+        .expect("primary HDU should exist");
+    assert_eq!(index.data_size, 3);
+    reader
+        .skip_data()
+        .expect("lax mode should skip checksum mismatch");
+}
+
+#[test]
+fn validates_hdu_checksum_value() {
+    let mut bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "CHECKSUM= '0000000000000000'",
+        "END",
+    ]);
+    bytes.resize(BLOCK_SIZE, b' ');
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::ChecksumMismatch { keyword, .. }) if keyword == "CHECKSUM"
+    ));
+}

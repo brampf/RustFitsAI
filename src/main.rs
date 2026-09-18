@@ -8,7 +8,7 @@ use rustfitsai::FitsReader;
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
         eprintln!("error: {error}");
-        eprintln!("usage: rustfitsai [-v|--verbose] <input> [output]");
+        eprintln!("usage: rustfitsai [-v|--verbose] [-lax|--lax] <input> [output]");
         process::exit(1);
     }
 }
@@ -25,9 +25,12 @@ fn run(arguments: Vec<String>) -> io::Result<()> {
     let verbose = arguments
         .iter()
         .any(|argument| argument == "--verbose" || argument == "-v");
+    let lax = arguments
+        .iter()
+        .any(|argument| argument == "--lax" || argument == "-lax");
     let positional: Vec<&String> = arguments
         .iter()
-        .filter(|argument| *argument != "--verbose" && *argument != "-v")
+        .filter(|argument| !matches!(argument.as_str(), "--verbose" | "-v" | "--lax" | "-lax"))
         .collect();
     if positional.is_empty() || positional.len() > 2 {
         return Err(io::Error::new(
@@ -38,7 +41,7 @@ fn run(arguments: Vec<String>) -> io::Result<()> {
 
     let input = PathBuf::from(positional[0]);
     let file = fs::File::open(&input)?;
-    let mut reader = FitsReader::new(file);
+    let mut reader = FitsReader::with_lax(file, lax);
     let mut hdu_count = 0;
     while let Some(index) = reader
         .next_hdu()
@@ -78,8 +81,8 @@ fn run(arguments: Vec<String>) -> io::Result<()> {
 }
 
 fn print_help() {
-    println!("usage: rustfitsai [-v|--verbose] <input> [output]");
+    println!("usage: rustfitsai [-v|--verbose] [-lax|--lax] <input> [output]");
     println!(
-        "\nReads and parses FITS HDUs. Verbose mode prints every logical 80-character header card. If output is supplied, the original bytes are also written there."
+        "\nReads and parses FITS HDUs. Verbose mode prints every logical 80-character header card. Lax mode skips DATASUM/CHECKSUM validation. If output is supplied, the original bytes are also written there."
     );
 }

@@ -11,27 +11,72 @@ use std::fmt;
 pub enum FitsError {
     Io(String),
     EmptyFile,
-    Truncated { offset: usize, expected: usize },
-    InvalidHeader { offset: usize, message: String },
-    InvalidKeyword { offset: usize },
-    InvalidKeywordName { keyword: String },
-    InvalidValueIndicator { keyword: String },
-    InvalidValue { keyword: String, value: String },
-    MissingMandatoryKeyword { keyword: String },
-    InvalidKeywordOrder { keyword: String },
-    InvalidMandatoryValue { keyword: String, value: String },
-    InvalidMandatoryFormat { keyword: String },
-    InvalidReservedValue { keyword: String, value: String },
-    InvalidReservedPlacement { keyword: String },
-    InvalidArrayKeyword { keyword: String, message: String },
-    InvalidIntegrityKeyword { keyword: String, message: String },
+    Truncated {
+        offset: usize,
+        expected: usize,
+    },
+    InvalidHeader {
+        offset: usize,
+        message: String,
+    },
+    InvalidKeyword {
+        offset: usize,
+    },
+    InvalidKeywordName {
+        keyword: String,
+    },
+    InvalidValueIndicator {
+        keyword: String,
+    },
+    InvalidValue {
+        keyword: String,
+        value: String,
+    },
+    MissingMandatoryKeyword {
+        keyword: String,
+    },
+    InvalidKeywordOrder {
+        keyword: String,
+    },
+    InvalidMandatoryValue {
+        keyword: String,
+        value: String,
+    },
+    InvalidMandatoryFormat {
+        keyword: String,
+    },
+    InvalidReservedValue {
+        keyword: String,
+        value: String,
+    },
+    InvalidReservedPlacement {
+        keyword: String,
+    },
+    InvalidArrayKeyword {
+        keyword: String,
+        message: String,
+    },
+    InvalidIntegrityKeyword {
+        keyword: String,
+        message: String,
+    },
+    ChecksumMismatch {
+        keyword: String,
+        expected: String,
+        actual: String,
+    },
     InvalidEndRecord,
     MissingExtensionType,
-    InvalidSpecialRecords { offset: usize, message: String },
+    InvalidSpecialRecords {
+        offset: usize,
+        message: String,
+    },
     DataPending,
     NoPendingData,
     SpecialRecordsNotReady,
-    SizeOverflow { keyword: String },
+    SizeOverflow {
+        keyword: String,
+    },
 }
 
 impl fmt::Display for FitsError {
@@ -99,6 +144,16 @@ impl fmt::Display for FitsError {
             }
             Self::InvalidIntegrityKeyword { keyword, message } => {
                 write!(formatter, "invalid integrity keyword {keyword}: {message}")
+            }
+            Self::ChecksumMismatch {
+                keyword,
+                expected,
+                actual,
+            } => {
+                write!(
+                    formatter,
+                    "checksum mismatch for {keyword}: expected {expected}, calculated {actual}"
+                )
             }
             Self::InvalidEndRecord => {
                 write!(
