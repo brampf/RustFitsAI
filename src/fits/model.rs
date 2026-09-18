@@ -37,6 +37,62 @@ pub struct HduIndex {
     pub data_size: usize,
 }
 
+/// The binary representation selected by `BITPIX` in FITS 5.2 and 5.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataRepresentation {
+    /// Unsigned byte data; callers may interpret values below 128 as ASCII.
+    Byte,
+    /// Big-endian two's-complement 16-bit integer.
+    Integer16,
+    /// Big-endian two's-complement 32-bit integer.
+    Integer32,
+    /// Big-endian two's-complement 64-bit integer.
+    Integer64,
+    /// Big-endian IEEE-754 single-precision value.
+    Float32,
+    /// Big-endian IEEE-754 double-precision value.
+    Float64,
+}
+
+impl DataRepresentation {
+    /// Maps a validated FITS `BITPIX` value to its binary data representation.
+    pub fn from_bitpix(bitpix: &str) -> Option<Self> {
+        match bitpix.parse::<i16>().ok()? {
+            8 => Some(Self::Byte),
+            16 => Some(Self::Integer16),
+            32 => Some(Self::Integer32),
+            64 => Some(Self::Integer64),
+            -32 => Some(Self::Float32),
+            -64 => Some(Self::Float64),
+            _ => None,
+        }
+    }
+}
+
+/// One decoded scalar from a FITS Data Unit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DataValue {
+    /// An unsigned 8-bit value; ASCII interpretation is caller-controlled.
+    Byte(u8),
+    /// A signed big-endian 16-bit value decoded from the Data Unit.
+    Integer16(i16),
+    /// A signed big-endian 32-bit value decoded from the Data Unit.
+    Integer32(i32),
+    /// A signed big-endian 64-bit value decoded from the Data Unit.
+    Integer64(i64),
+    /// An IEEE-754 single-precision value decoded from the Data Unit.
+    Float32(f32),
+    /// An IEEE-754 double-precision value decoded from the Data Unit.
+    Float64(f64),
+}
+
+impl HduIndex {
+    /// Returns the scalar representation implied by this HDU's `BITPIX`.
+    pub fn data_representation(&self) -> Option<DataRepresentation> {
+        DataRepresentation::from_bitpix(self.header.value("BITPIX")?)
+    }
+}
+
 impl Hdu {
     /// Returns the extension type from `XTENSION`, if this HDU is an extension.
     ///

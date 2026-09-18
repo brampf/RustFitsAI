@@ -3,7 +3,7 @@
 
 use std::io::Cursor;
 
-use rustfitsai::{BLOCK_SIZE, FitsError, FitsFile, FitsReader, Value};
+use rustfitsai::{BLOCK_SIZE, DataValue, FitsError, FitsFile, FitsReader, Value};
 
 fn card(text: &str) -> [u8; 80] {
     let mut result = [b' '; 80];
@@ -662,4 +662,42 @@ fn validates_hdu_checksum_value() {
         FitsFile::from_bytes(&bytes),
         Err(FitsError::ChecksumMismatch { keyword, .. }) if keyword == "CHECKSUM"
     ));
+}
+
+#[test]
+fn streams_big_endian_integer_and_ieee_values() {
+    let mut integer_bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                   16",
+        "NAXIS   =                    1",
+        "NAXIS1  =                    2",
+        "END",
+    ]);
+    integer_bytes.extend_from_slice(&[0xFF, 0xFE, 0x01, 0x02]);
+    integer_bytes.resize(BLOCK_SIZE * 2, 0);
+    let mut reader = FitsReader::new(Cursor::new(integer_bytes));
+    reader.next_hdu().unwrap().unwrap();
+    let mut values = Vec::new();
+    reader.read_data_values(|value| values.push(value)).unwrap();
+    assert_eq!(
+        values,
+        vec![DataValue::Integer16(-2), DataValue::Integer16(258)]
+    );
+
+    let mut float_bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                  -32",
+        "NAXIS   =                    1",
+        "NAXIS1  =                    1",
+        "END",
+    ]);
+    float_bytes.extend_from_slice(&1.5_f32.to_bits().to_be_bytes());
+    float_bytes.resize(BLOCK_SIZE * 2, 0);
+    let mut reader = FitsReader::new(Cursor::new(float_bytes));
+    reader.next_hdu().unwrap().unwrap();
+    let mut value = None;
+    reader
+        .read_data_values(|decoded| value = Some(decoded))
+        .unwrap();
+    assert_eq!(value, Some(DataValue::Float32(1.5)));
 }

@@ -3,7 +3,9 @@
 
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
-use super::{Card, FitsError, FitsFile, Hdu, HduIndex, Header, Value};
+use super::{
+    Card, DataRepresentation, DataValue, FitsError, FitsFile, Hdu, HduIndex, Header, Value,
+};
 
 /// Logical FITS block size from FITS 4.0 Sections 3.1-3.3.
 pub const BLOCK_SIZE: usize = 2880;
@@ -30,6 +32,7 @@ struct PendingData {
     padded_size: usize,
     datasum: Option<u32>,
     checksum_header: Option<Vec<u8>>,
+    representation: super::DataRepresentation,
 }
 
 impl<R: Read> FitsReader<R> {
@@ -90,6 +93,8 @@ impl<R: Read> FitsReader<R> {
             padded_size,
             datasum,
             checksum_header,
+            representation: DataRepresentation::from_bitpix(header.value("BITPIX").unwrap())
+                .expect("validated BITPIX has a data representation"),
         });
         self.first_hdu = false;
 
@@ -136,6 +141,48 @@ impl<R: Read> FitsReader<R> {
             })?;
         self.read_data_to(&mut data)?;
         Ok(data)
+    }
+
+    /// Decodes the current Data Unit value-by-value in FITS big-endian order.
+    ///
+    /// The callback receives one scalar at a time, so this method does not
+    /// allocate the Data Unit. `BITPIX=8` is exposed as [`DataValue::Byte`];
+    /// callers may validate the high bit when using the bytes as ASCII as
+    /// required by FITS 5.1.
+    pub fn read_data_values<F>(&mut self, mut callback: F) -> Result<(), FitsError>
+    where
+        F: FnMut(DataValue),
+    {
+        let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
+        let width = match pending.representation {
+            super::DataRepresentation::Byte => 1,
+            super::DataRepresentation::Integer16 => 2,
+            super::DataRepresentation::Integer32 | super::DataRepresentation::Float32 => 4,
+            super::DataRepresentation::Integer64 | super::DataRepresentation::Float64 => 8,
+        };
+        if pending.size % width != 0 {
+            return Err(FitsError::InvalidValue {
+                keyword: "BITPIX".to_string(),
+                value: "data size is not aligned to its scalar width".to_string(),
+            });
+        }
+        let padding = pending.padded_size - pending.size;
+        let mut checksum = OnesComplement::default();
+        let mut value = [0_u8; 8];
+        for _ in 0..pending.size / width {
+            self.reader
+                .read_exact(&mut value[..width])
+                .map_err(io_error)?;
+            checksum.update(&value[..width]);
+            callback(decode_value(pending.representation, &value));
+        }
+        copy_exact_checksum(&mut self.reader, &mut io::sink(), padding, &mut checksum)?;
+        if !self.lax_checksums {
+            let data_sum = checksum.finish();
+            validate_data_checksum(pending.datasum, data_sum)?;
+            validate_hdu_checksum(pending.checksum_header.as_deref(), data_sum)?;
+        }
+        Ok(())
     }
 
     /// Consumes the current Data Unit without retaining its bytes.
@@ -290,6 +337,25 @@ fn copy_exact<R: Read, W: Write>(
         remaining -= requested;
     }
     Ok(())
+}
+
+fn decode_value(representation: DataRepresentation, bytes: &[u8; 8]) -> DataValue {
+    match representation {
+        DataRepresentation::Byte => DataValue::Byte(bytes[0]),
+        DataRepresentation::Integer16 => {
+            DataValue::Integer16(i16::from_be_bytes([bytes[0], bytes[1]]))
+        }
+        DataRepresentation::Integer32 => {
+            DataValue::Integer32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataRepresentation::Integer64 => DataValue::Integer64(i64::from_be_bytes(*bytes)),
+        DataRepresentation::Float32 => DataValue::Float32(f32::from_bits(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        DataRepresentation::Float64 => {
+            DataValue::Float64(f64::from_bits(u64::from_be_bytes(*bytes)))
+        }
+    }
 }
 
 #[derive(Default)]
