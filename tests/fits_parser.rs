@@ -169,16 +169,16 @@ fn accepts_spec_keyword_names_and_commentary_records() {
     let bytes = header(&[
         "SIMPLE  =                    T",
         "BITPIX  =                    8",
+        "NAXIS   =                    0",
         "FOO-BAR =                    7",
         "COMMENT this is commentary",
-        "NAXIS   =                    0",
         "END",
     ]);
 
     let file = FitsFile::from_bytes(&bytes).expect("valid keyword records should parse");
     assert_eq!(file.hdus[0].header.value("FOO-BAR"), Some("7"));
     assert_eq!(
-        file.hdus[0].header.cards[3].comment.as_deref(),
+        file.hdus[0].header.cards[4].comment.as_deref(),
         Some("this is commentary")
     );
 }
@@ -216,17 +216,17 @@ fn parses_string_values_and_distinguishes_undefined_values() {
     let bytes = header(&[
         "SIMPLE  =                    T",
         "BITPIX  =                    8",
+        "NAXIS   =                    0",
         "STRKEY  = 'O''HARA  ' / a string",
         "NULLKEY =                    / undefined",
-        "NAXIS   =                    0",
         "END",
     ]);
 
     let file = FitsFile::from_bytes(&bytes).expect("string values should parse");
     let cards = &file.hdus[0].header.cards;
     assert_eq!(file.hdus[0].header.value("STRKEY"), Some("O'HARA  "));
-    assert_eq!(cards[2].value, Some(Value::String("O'HARA  ".to_string())));
-    assert_eq!(cards[3].value, Some(Value::Undefined));
+    assert_eq!(cards[3].value, Some(Value::String("O'HARA  ".to_string())));
+    assert_eq!(cards[4].value, Some(Value::Undefined));
 }
 
 #[test]
@@ -234,10 +234,10 @@ fn reconstructs_continue_string_values() {
     let bytes = header(&[
         "SIMPLE  =                    T",
         "BITPIX  =                    8",
+        "NAXIS   =                    0",
         "LONGKEY = 'first part&'",
         "CONTINUE  'second part&'",
         "CONTINUE  'last part'",
-        "NAXIS   =                    0",
         "END",
     ]);
 
@@ -253,8 +253,8 @@ fn rejects_unterminated_string_values() {
     let bytes = header(&[
         "SIMPLE  =                    T",
         "BITPIX  =                    8",
-        "STRKEY  = 'unterminated",
         "NAXIS   =                    0",
+        "STRKEY  = 'unterminated",
         "END",
     ]);
 
@@ -269,34 +269,34 @@ fn classifies_logical_numeric_and_complex_values() {
     let bytes = header(&[
         "SIMPLE  =                    T",
         "BITPIX  =                   16",
+        "NAXIS   =                    0",
         "LOGICAL =                    F",
         "INTEGER =                  +007",
         "REALNUM =              -1.2E+3",
         "REALINT =                 1E3",
         "CINT    =              (12,-4)",
         "CREAL   =          (1.5, -2.0)",
-        "NAXIS   =                    0",
         "END",
     ]);
 
     let file = FitsFile::from_bytes(&bytes).expect("scalar values should parse");
     let header = &file.hdus[0].header;
-    assert_eq!(header.cards[2].value, Some(Value::Logical("F".to_string())));
+    assert_eq!(header.cards[3].value, Some(Value::Logical("F".to_string())));
     assert_eq!(
-        header.cards[3].value,
+        header.cards[4].value,
         Some(Value::Integer("+007".to_string()))
     );
     assert_eq!(
-        header.cards[4].value,
+        header.cards[5].value,
         Some(Value::Real("-1.2E+3".to_string()))
     );
-    assert_eq!(header.cards[5].value, Some(Value::Real("1E3".to_string())));
+    assert_eq!(header.cards[6].value, Some(Value::Real("1E3".to_string())));
     assert_eq!(
-        header.cards[6].value,
+        header.cards[7].value,
         Some(Value::ComplexInteger("(12, -4)".to_string()))
     );
     assert_eq!(
-        header.cards[7].value,
+        header.cards[8].value,
         Some(Value::ComplexReal("(1.5, -2.0)".to_string()))
     );
 }
@@ -306,21 +306,21 @@ fn validates_datetime_and_unit_string_views() {
     let bytes = header(&[
         "SIMPLE  =                    T",
         "BITPIX  =                    8",
+        "NAXIS   =                    0",
         "DATEKEY = '2026-09-19T12:34:56Z'",
         "BUNIT   = 'W m-2 Hz-1'",
-        "NAXIS   =                    0",
         "END",
     ]);
 
     let file = FitsFile::from_bytes(&bytes).expect("datetime and unit strings should parse");
     let header = &file.hdus[0].header;
-    let date = header.cards[2]
+    let date = header.cards[3]
         .value
         .as_ref()
         .unwrap()
         .as_datetime()
         .unwrap();
-    let unit = header.cards[3].value.as_ref().unwrap().as_unit().unwrap();
+    let unit = header.cards[4].value.as_ref().unwrap().as_unit().unwrap();
     assert_eq!(date.as_str(), "2026-09-19T12:34:56Z");
     assert_eq!(unit.as_str(), "W m-2 Hz-1");
 }
@@ -329,4 +329,291 @@ fn validates_datetime_and_unit_string_views() {
 fn rejects_invalid_datetime_and_control_character_units() {
     assert!(rustfitsai::DateTime::parse("2026-09-19 12:34:56Z").is_none());
     assert!(rustfitsai::UnitString::parse("m\n").is_none());
+}
+
+#[test]
+fn validates_primary_mandatory_keyword_order() {
+    let bytes = header(&[
+        "BITPIX  =                    8",
+        "SIMPLE  =                    T",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidKeywordOrder { keyword }) if keyword == "SIMPLE"
+    ));
+}
+
+#[test]
+fn requires_each_naxis_keyword() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    1",
+        "END",
+    ]);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::MissingMandatoryKeyword { keyword }) if keyword == "NAXIS1"
+    ));
+}
+
+#[test]
+fn rejects_invalid_bitpix_and_end_records() {
+    let invalid_bitpix = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                  128",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+    assert!(matches!(
+        FitsFile::from_bytes(&invalid_bitpix),
+        Err(FitsError::InvalidMandatoryValue { keyword, .. }) if keyword == "BITPIX"
+    ));
+
+    let invalid_end = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "END     =                    T",
+    ]);
+    assert!(matches!(
+        FitsFile::from_bytes(&invalid_end),
+        Err(FitsError::InvalidEndRecord)
+    ));
+}
+
+#[test]
+fn validates_optional_reserved_keywords() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "DATE    = '2026-09-19'",
+        "ORIGIN  = 'May Observatory'",
+        "EXTEND  =                    T",
+        "BLOCKED =                    T",
+        "END",
+    ]);
+
+    let file = FitsFile::from_bytes(&bytes).expect("valid reserved keywords should parse");
+    assert_eq!(file.hdus[0].header.value("ORIGIN"), Some("May Observatory"));
+}
+
+#[test]
+fn rejects_invalid_reserved_keyword_values_and_placements() {
+    let invalid_date = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "DATE    = '2026/09/19'",
+        "END",
+    ]);
+    assert!(matches!(
+        FitsFile::from_bytes(&invalid_date),
+        Err(FitsError::InvalidReservedValue { keyword, .. }) if keyword == "DATE"
+    ));
+
+    let extension = header(&[
+        "XTENSION= 'CUSTOM  '",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "PCOUNT  =                    0",
+        "GCOUNT  =                    1",
+        "EXTEND  =                    T",
+        "END",
+    ]);
+    let mut bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+    bytes.extend_from_slice(&extension);
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidReservedPlacement { keyword }) if keyword == "EXTEND"
+    ));
+}
+
+#[test]
+fn validates_observation_and_bibliographic_keywords() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "DATE-OBS= '2026-09-19T12:00:00'",
+        "TELESCOP= 'May Scope'",
+        "INSTRUME= 'Spectrometer'",
+        "OBSERVER= 'May'",
+        "OBJECT  = 'M 31'",
+        "AUTHOR  = 'May'",
+        "REFERENC= 'doi:10.1234/example'",
+        "COMMENT first comment",
+        "COMMENT = second comment",
+        "HISTORY processing step one",
+        "HISTORY = processing step two",
+        "END",
+    ]);
+
+    let file = FitsFile::from_bytes(&bytes).expect("reserved descriptive keywords should parse");
+    let header = &file.hdus[0].header;
+    assert_eq!(header.value("TELESCOP"), Some("May Scope"));
+    assert_eq!(
+        header
+            .cards
+            .iter()
+            .filter(|card| card.keyword == "COMMENT")
+            .count(),
+        2
+    );
+    assert_eq!(
+        header
+            .cards
+            .iter()
+            .filter(|card| card.keyword == "HISTORY")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn rejects_invalid_date_observation_value() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "DATE-OBS= '2026-02-30'",
+        "END",
+    ]);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidReservedValue { keyword, .. }) if keyword == "DATE-OBS"
+    ));
+}
+
+#[test]
+fn validates_array_description_keywords() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                   16",
+        "NAXIS   =                    0",
+        "BSCALE  =                  1.0",
+        "BZERO   =                  0.0",
+        "BUNIT   = 'adu'",
+        "BLANK   =                 -999",
+        "DATAMIN =                 -1.0",
+        "DATAMAX =                100.0",
+        "END",
+    ]);
+
+    FitsFile::from_bytes(&bytes).expect("valid array keywords should parse");
+}
+
+#[test]
+fn rejects_array_keywords_in_non_array_extensions() {
+    let primary = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+    let extension = header(&[
+        "XTENSION= 'TABLE   '",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "PCOUNT  =                    0",
+        "GCOUNT  =                    1",
+        "BUNIT   = 'adu'",
+        "END",
+    ]);
+    let mut bytes = primary;
+    bytes.extend_from_slice(&extension);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidArrayKeyword { keyword, .. }) if keyword == "BUNIT"
+    ));
+}
+
+#[test]
+fn requires_bscale_and_bzero_together() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "BSCALE  =                  1.0",
+        "END",
+    ]);
+
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidArrayKeyword { keyword, .. }) if keyword == "BSCALE"
+    ));
+}
+
+#[test]
+fn validates_extension_and_integrity_keywords() {
+    let mut bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+    bytes.extend_from_slice(&header(&[
+        "XTENSION= 'IMAGE   '",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "PCOUNT  =                    0",
+        "GCOUNT  =                    1",
+        "INHERIT =                    T",
+        "EXTNAME = 'SCIENCE '",
+        "EXTVER  =                    2",
+        "EXTLEVEL=                    1",
+        "DATASUM = '0'",
+        "CHECKSUM= '                '",
+        "END",
+    ]));
+
+    FitsFile::from_bytes(&bytes).expect("extension and integrity keywords should parse");
+}
+
+#[test]
+fn rejects_misplaced_inherit_and_invalid_checksum_values() {
+    let mut bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "END",
+    ]);
+    bytes.extend_from_slice(&header(&[
+        "XTENSION= 'IMAGE   '",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "PCOUNT  =                    0",
+        "GCOUNT  =                    1",
+        "EXTNAME = 'SCIENCE '",
+        "INHERIT =                    T",
+        "END",
+    ]));
+    assert!(matches!(
+        FitsFile::from_bytes(&bytes),
+        Err(FitsError::InvalidReservedPlacement { keyword }) if keyword == "INHERIT"
+    ));
+
+    let invalid_checksum = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "CHECKSUM= 'short'",
+        "END",
+    ]);
+    assert!(matches!(
+        FitsFile::from_bytes(&invalid_checksum),
+        Err(FitsError::InvalidIntegrityKeyword { keyword, .. }) if keyword == "CHECKSUM"
+    ));
 }

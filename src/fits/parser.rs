@@ -62,6 +62,7 @@ impl<R: Read> FitsReader<R> {
         }
 
         let header = parse_header(&mut self.reader)?;
+        validate_header(&header, self.first_hdu)?;
         let data_size = data_size(&header, self.first_hdu)?;
         let padded_size = padded_size(data_size)?;
         self.pending_data = Some(PendingData {
@@ -196,6 +197,9 @@ fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
             raw_cards.push(String::from_utf8_lossy(card_bytes).into_owned());
             let keyword = keyword_name(&card_bytes[..8])?;
             if keyword == "END" {
+                if card_bytes[8..].iter().any(|byte| *byte != b' ') {
+                    return Err(FitsError::InvalidEndRecord);
+                }
                 found_end = true;
                 break;
             }
@@ -432,6 +436,498 @@ fn split_value_comment(field: &str) -> (String, Option<String>) {
     (field.trim_end().to_string(), None)
 }
 
+fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
+    let keywords: Vec<&str> = header
+        .cards
+        .iter()
+        .map(|card| card.keyword.as_str())
+        .collect();
+    let naxis = validate_integer(header, "NAXIS", |value| (0..=999).contains(&value))?;
+    let naxis = naxis as usize;
+    let mut expected: Vec<String> = if primary {
+        vec![
+            "SIMPLE".to_string(),
+            "BITPIX".to_string(),
+            "NAXIS".to_string(),
+        ]
+    } else {
+        vec![
+            "XTENSION".to_string(),
+            "BITPIX".to_string(),
+            "NAXIS".to_string(),
+        ]
+    };
+    for axis in 1..=naxis {
+        expected.push(format!("NAXIS{axis}"));
+    }
+    if !primary {
+        expected.extend(["PCOUNT".to_string(), "GCOUNT".to_string()]);
+    }
+    for (index, expected_keyword) in expected.iter().enumerate() {
+        if keywords.get(index) != Some(&expected_keyword.as_str()) {
+            return Err(if keywords.get(index).is_none() {
+                FitsError::MissingMandatoryKeyword {
+                    keyword: (*expected_keyword).to_string(),
+                }
+            } else {
+                FitsError::InvalidKeywordOrder {
+                    keyword: (*expected_keyword).to_string(),
+                }
+            });
+        }
+    }
+    if primary {
+        if keywords.contains(&"XTENSION") {
+            return Err(FitsError::InvalidKeywordOrder {
+                keyword: "XTENSION".to_string(),
+            });
+        }
+        validate_logical(header, "SIMPLE")?;
+        validate_fixed_logical(header, "SIMPLE")?;
+    } else {
+        if keywords.contains(&"SIMPLE") {
+            return Err(FitsError::InvalidKeywordOrder {
+                keyword: "SIMPLE".to_string(),
+            });
+        }
+        validate_string(header, "XTENSION")?;
+        validate_fixed_string(header, "XTENSION", true)?;
+        validate_integer(header, "PCOUNT", |value| value >= 0)?;
+        validate_integer(header, "GCOUNT", |value| value >= 0)?;
+        if let Some(index) = keywords.iter().position(|keyword| *keyword == "INHERIT") {
+            let mandatory_count = 5 + naxis;
+            if index != mandatory_count {
+                return Err(FitsError::InvalidReservedPlacement {
+                    keyword: "INHERIT".to_string(),
+                });
+            }
+        }
+    }
+    validate_reserved_keywords(header, primary)?;
+    validate_array_keywords(header, primary)?;
+    validate_extension_and_integrity_keywords(header, primary)?;
+    validate_integer(header, "BITPIX", |value| {
+        matches!(value, 8 | 16 | 32 | 64 | -32 | -64)
+    })?;
+    validate_fixed_integer(header, "BITPIX")?;
+    for axis in 1..=naxis {
+        validate_integer(header, &format!("NAXIS{axis}"), |value| value >= 0)?;
+        validate_fixed_integer(header, &format!("NAXIS{axis}"))?;
+    }
+    if primary {
+        validate_fixed_integer(header, "NAXIS")?;
+    } else {
+        validate_fixed_integer(header, "NAXIS")?;
+        validate_fixed_integer(header, "PCOUNT")?;
+        validate_fixed_integer(header, "GCOUNT")?;
+    }
+    for keyword in keywords {
+        if let Some(axis) = indexed_axis(keyword) {
+            if axis == 0 || axis > naxis {
+                return Err(FitsError::InvalidKeywordOrder {
+                    keyword: keyword.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_reserved_keywords(header: &Header, primary: bool) -> Result<(), FitsError> {
+    for (index, card) in header.cards.iter().enumerate() {
+        match card.keyword.as_str() {
+            keyword if keyword.starts_with("DATE") => validate_date_keyword(card)?,
+            "ORIGIN" | "TELESCOP" | "INSTRUME" | "OBSERVER" | "OBJECT" | "AUTHOR" | "REFERENC" => {
+                validate_string(header, card.keyword.as_str())?
+            }
+            "EXTEND" => {
+                if !primary {
+                    return Err(FitsError::InvalidReservedPlacement {
+                        keyword: "EXTEND".to_string(),
+                    });
+                }
+                validate_logical(header, "EXTEND")?;
+            }
+            "BLOCKED" => {
+                if !primary || index >= 36 {
+                    return Err(FitsError::InvalidReservedPlacement {
+                        keyword: "BLOCKED".to_string(),
+                    });
+                }
+                if header.value("BLOCKED") != Some("T") {
+                    return Err(FitsError::InvalidReservedValue {
+                        keyword: "BLOCKED".to_string(),
+                        value: header.value("BLOCKED").unwrap_or("missing").to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_array_keywords(header: &Header, primary: bool) -> Result<(), FitsError> {
+    let is_image = primary || header.value("XTENSION") == Some("IMAGE");
+    let array_keywords = ["BSCALE", "BZERO", "BUNIT", "BLANK", "DATAMIN", "DATAMAX"];
+    if !is_image {
+        if let Some(keyword) = array_keywords
+            .iter()
+            .find(|keyword| header.cards.iter().any(|card| card.keyword == **keyword))
+        {
+            return Err(FitsError::InvalidArrayKeyword {
+                keyword: (*keyword).to_string(),
+                message: "keyword is only valid for array HDUs".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    let has_bscale = header.cards.iter().any(|card| card.keyword == "BSCALE");
+    let has_bzero = header.cards.iter().any(|card| card.keyword == "BZERO");
+    if has_bscale != has_bzero {
+        return Err(FitsError::InvalidArrayKeyword {
+            keyword: if has_bscale { "BSCALE" } else { "BZERO" }.to_string(),
+            message: "BSCALE and BZERO must be used together".to_string(),
+        });
+    }
+    for keyword in ["BSCALE", "BZERO"] {
+        if has_bscale && !is_real_value(header, keyword) {
+            return Err(FitsError::InvalidArrayKeyword {
+                keyword: keyword.to_string(),
+                message: "expected a floating-point value".to_string(),
+            });
+        }
+    }
+    if header.cards.iter().any(|card| card.keyword == "BUNIT") {
+        if card_value(header, "BUNIT")
+            .and_then(Value::as_unit)
+            .is_none()
+        {
+            return Err(FitsError::InvalidArrayKeyword {
+                keyword: "BUNIT".to_string(),
+                message: "expected a valid unit string".to_string(),
+            });
+        }
+    }
+    if header.cards.iter().any(|card| card.keyword == "BLANK") {
+        let bitpix = header
+            .value("BITPIX")
+            .and_then(|value| value.parse::<i64>().ok());
+        if !bitpix.is_some_and(|value| value > 0) || !is_integer_value(header, "BLANK") {
+            return Err(FitsError::InvalidArrayKeyword {
+                keyword: "BLANK".to_string(),
+                message: "BLANK requires positive BITPIX and an integer value".to_string(),
+            });
+        }
+    }
+    for keyword in ["DATAMIN", "DATAMAX"] {
+        if header.cards.iter().any(|card| card.keyword == keyword)
+            && !is_real_value(header, keyword)
+        {
+            return Err(FitsError::InvalidArrayKeyword {
+                keyword: keyword.to_string(),
+                message: "expected a floating-point value".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_extension_and_integrity_keywords(
+    header: &Header,
+    primary: bool,
+) -> Result<(), FitsError> {
+    for keyword in ["EXTNAME", "DATASUM", "CHECKSUM"] {
+        if header.cards.iter().any(|card| card.keyword == keyword)
+            && !matches!(card_value(header, keyword), Some(Value::String(_)))
+        {
+            return Err(FitsError::InvalidReservedValue {
+                keyword: keyword.to_string(),
+                value: "expected a character string".to_string(),
+            });
+        }
+    }
+    for keyword in ["EXTVER", "EXTLEVEL"] {
+        if header.cards.iter().any(|card| card.keyword == keyword)
+            && !is_integer_value(header, keyword)
+        {
+            return Err(FitsError::InvalidReservedValue {
+                keyword: keyword.to_string(),
+                value: "expected an integer".to_string(),
+            });
+        }
+    }
+    if let Some(value) = header.value("EXTLEVEL") {
+        if value.parse::<i64>().ok().is_none_or(|value| value < 1) {
+            return Err(FitsError::InvalidReservedValue {
+                keyword: "EXTLEVEL".to_string(),
+                value: value.to_string(),
+            });
+        }
+    }
+    if header.cards.iter().any(|card| card.keyword == "INHERIT") {
+        if primary {
+            return Err(FitsError::InvalidReservedPlacement {
+                keyword: "INHERIT".to_string(),
+            });
+        }
+        validate_logical(header, "INHERIT")?;
+    }
+    validate_datasum(header)?;
+    validate_checksum(header)?;
+    Ok(())
+}
+
+fn validate_datasum(header: &Header) -> Result<(), FitsError> {
+    let Some(Value::String(value)) = card_value(header, "DATASUM") else {
+        return Ok(());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(FitsError::InvalidIntegrityKeyword {
+            keyword: "DATASUM".to_string(),
+            message: "expected an unsigned decimal string or blanks".to_string(),
+        })
+    }
+}
+
+fn validate_checksum(header: &Header) -> Result<(), FitsError> {
+    let Some(Value::String(value)) = card_value(header, "CHECKSUM") else {
+        return Ok(());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || value.len() == 16 {
+        Ok(())
+    } else {
+        Err(FitsError::InvalidIntegrityKeyword {
+            keyword: "CHECKSUM".to_string(),
+            message: "expected a 16-character checksum string or blanks".to_string(),
+        })
+    }
+}
+
+fn card_value<'a>(header: &'a Header, keyword: &str) -> Option<&'a Value> {
+    header
+        .cards
+        .iter()
+        .find(|card| card.keyword == keyword)
+        .and_then(|card| card.value.as_ref())
+}
+
+fn is_real_value(header: &Header, keyword: &str) -> bool {
+    matches!(
+        card_value(header, keyword),
+        Some(Value::Integer(_) | Value::Real(_))
+    )
+}
+
+fn is_integer_value(header: &Header, keyword: &str) -> bool {
+    matches!(card_value(header, keyword), Some(Value::Integer(_)))
+}
+
+fn validate_date_keyword(card: &Card) -> Result<(), FitsError> {
+    let Some(Value::String(value)) = card.value.as_ref() else {
+        return Err(FitsError::InvalidReservedValue {
+            keyword: card.keyword.clone(),
+            value: "expected a character string".to_string(),
+        });
+    };
+    if is_iso_date(value) || is_iso_datetime(value) || is_legacy_date(value) {
+        Ok(())
+    } else {
+        Err(FitsError::InvalidReservedValue {
+            keyword: card.keyword.clone(),
+            value: value.to_string(),
+        })
+    }
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let parts: Vec<_> = value.split('-').collect();
+    if parts.len() != 3
+        || parts[0].len() != 4
+        || parts[1].len() != 2
+        || parts[2].len() != 2
+        || !parts
+            .iter()
+            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    let year = parts[0].parse::<u32>().ok();
+    let month = parts[1].parse::<u32>().ok();
+    let day = parts[2].parse::<u32>().ok();
+    matches!((year, month, day), (Some(year), Some(month), Some(day)) if (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day))
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn is_iso_datetime(value: &str) -> bool {
+    let Some((date, time)) = value.split_once('T') else {
+        return false;
+    };
+    if !is_iso_date(date) {
+        return false;
+    }
+    let time = time.strip_suffix('Z').unwrap_or(time);
+    let parts: Vec<_> = time.split(':').collect();
+    if parts.len() != 3 || parts[0].len() != 2 || parts[1].len() != 2 {
+        return false;
+    }
+    let (seconds, fraction) = parts[2]
+        .split_once('.')
+        .map_or((parts[2], None), |(s, f)| (s, Some(f)));
+    parts[0].bytes().all(|byte| byte.is_ascii_digit())
+        && parts[1].bytes().all(|byte| byte.is_ascii_digit())
+        && seconds.len() == 2
+        && seconds.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn is_legacy_date(value: &str) -> bool {
+    let parts: Vec<_> = value.split('/').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn indexed_axis(keyword: &str) -> Option<usize> {
+    let suffix = keyword.strip_prefix("NAXIS")?;
+    if suffix.is_empty() || (suffix.len() > 1 && suffix.starts_with('0')) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+fn validate_integer<F>(header: &Header, keyword: &str, predicate: F) -> Result<i64, FitsError>
+where
+    F: Fn(i64) -> bool,
+{
+    let value = header
+        .value(keyword)
+        .ok_or_else(|| FitsError::MissingMandatoryKeyword {
+            keyword: keyword.to_string(),
+        })?;
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| FitsError::InvalidMandatoryValue {
+            keyword: keyword.to_string(),
+            value: value.to_string(),
+        })?;
+    if !predicate(parsed) {
+        return Err(FitsError::InvalidMandatoryValue {
+            keyword: keyword.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn validate_logical(header: &Header, keyword: &str) -> Result<(), FitsError> {
+    if !matches!(header.value(keyword), Some("T" | "F")) {
+        return Err(FitsError::InvalidMandatoryValue {
+            keyword: keyword.to_string(),
+            value: header.value(keyword).unwrap_or("missing").to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_string(header: &Header, keyword: &str) -> Result<(), FitsError> {
+    let is_string = header
+        .cards
+        .iter()
+        .find(|card| card.keyword == keyword)
+        .is_some_and(|card| matches!(card.value.as_ref(), Some(Value::String(_))));
+    if !is_string {
+        return Err(FitsError::InvalidMandatoryValue {
+            keyword: keyword.to_string(),
+            value: header.value(keyword).unwrap_or("missing").to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn raw_card<'a>(header: &'a Header, keyword: &str) -> Result<&'a [u8], FitsError> {
+    header
+        .raw_cards
+        .iter()
+        .find(|card| {
+            card.as_bytes()
+                .get(..8)
+                .is_some_and(|field| String::from_utf8_lossy(field).trim() == keyword)
+        })
+        .map(|card| card.as_bytes())
+        .ok_or_else(|| FitsError::MissingMandatoryKeyword {
+            keyword: keyword.to_string(),
+        })
+}
+
+fn validate_fixed_logical(header: &Header, keyword: &str) -> Result<(), FitsError> {
+    let card = raw_card(header, keyword)?;
+    if card.get(29).is_none_or(|byte| !matches!(byte, b'T' | b'F')) {
+        return Err(FitsError::InvalidMandatoryFormat {
+            keyword: keyword.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_fixed_integer(header: &Header, keyword: &str) -> Result<(), FitsError> {
+    let card = raw_card(header, keyword)?;
+    if card.len() < 30 || card[29] == b' ' {
+        return Err(FitsError::InvalidMandatoryFormat {
+            keyword: keyword.to_string(),
+        });
+    }
+    let field =
+        std::str::from_utf8(&card[10..30]).map_err(|_| FitsError::InvalidMandatoryFormat {
+            keyword: keyword.to_string(),
+        })?;
+    if field.trim() != header.value(keyword).unwrap_or("") {
+        return Err(FitsError::InvalidMandatoryFormat {
+            keyword: keyword.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_fixed_string(
+    header: &Header,
+    keyword: &str,
+    require_eight: bool,
+) -> Result<(), FitsError> {
+    let card = raw_card(header, keyword)?;
+    if card.get(10) != Some(&b'\'') {
+        return Err(FitsError::InvalidMandatoryFormat {
+            keyword: keyword.to_string(),
+        });
+    }
+    if require_eight
+        && header
+            .string_value(keyword)
+            .is_none_or(|value| value.len() < 8)
+    {
+        return Err(FitsError::InvalidMandatoryFormat {
+            keyword: keyword.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn data_size(header: &Header, primary: bool) -> Result<usize, FitsError> {
     if !primary && extension_type(header).is_none() {
         return Err(FitsError::MissingExtensionType);
@@ -483,7 +979,8 @@ fn bytes_per_value(header: &Header) -> Result<usize, FitsError> {
             value: "not an integer".to_string(),
         })?;
     match bitpix.unsigned_abs() {
-        8 | 16 | 32 | 64 | 128 => Ok(bitpix.unsigned_abs() as usize / 8),
+        8 | 16 | 32 | 64 => Ok(bitpix.unsigned_abs() as usize / 8),
+        _ if bitpix == -32 || bitpix == -64 => Ok(bitpix.unsigned_abs() as usize / 8),
         _ => Err(FitsError::InvalidValue {
             keyword: "BITPIX".to_string(),
             value: bitpix.to_string(),

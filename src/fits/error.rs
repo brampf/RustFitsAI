@@ -17,6 +17,15 @@ pub enum FitsError {
     InvalidKeywordName { keyword: String },
     InvalidValueIndicator { keyword: String },
     InvalidValue { keyword: String, value: String },
+    MissingMandatoryKeyword { keyword: String },
+    InvalidKeywordOrder { keyword: String },
+    InvalidMandatoryValue { keyword: String, value: String },
+    InvalidMandatoryFormat { keyword: String },
+    InvalidReservedValue { keyword: String, value: String },
+    InvalidReservedPlacement { keyword: String },
+    InvalidArrayKeyword { keyword: String, message: String },
+    InvalidIntegrityKeyword { keyword: String, message: String },
+    InvalidEndRecord,
     MissingExtensionType,
     InvalidSpecialRecords { offset: usize, message: String },
     DataPending,
@@ -51,6 +60,51 @@ impl fmt::Display for FitsError {
             }
             Self::InvalidValue { keyword, value } => {
                 write!(formatter, "invalid value for {keyword}: {value}")
+            }
+            Self::MissingMandatoryKeyword { keyword } => {
+                write!(formatter, "missing mandatory FITS keyword: {keyword}")
+            }
+            Self::InvalidKeywordOrder { keyword } => {
+                write!(
+                    formatter,
+                    "invalid order for mandatory FITS keyword: {keyword}"
+                )
+            }
+            Self::InvalidMandatoryValue { keyword, value } => {
+                write!(
+                    formatter,
+                    "invalid value for mandatory FITS keyword {keyword}: {value}"
+                )
+            }
+            Self::InvalidMandatoryFormat { keyword } => {
+                write!(
+                    formatter,
+                    "invalid fixed format for mandatory FITS keyword: {keyword}"
+                )
+            }
+            Self::InvalidReservedValue { keyword, value } => {
+                write!(
+                    formatter,
+                    "invalid value for reserved FITS keyword {keyword}: {value}"
+                )
+            }
+            Self::InvalidReservedPlacement { keyword } => {
+                write!(
+                    formatter,
+                    "reserved FITS keyword has invalid placement: {keyword}"
+                )
+            }
+            Self::InvalidArrayKeyword { keyword, message } => {
+                write!(formatter, "invalid array keyword {keyword}: {message}")
+            }
+            Self::InvalidIntegrityKeyword { keyword, message } => {
+                write!(formatter, "invalid integrity keyword {keyword}: {message}")
+            }
+            Self::InvalidEndRecord => {
+                write!(
+                    formatter,
+                    "END keyword record must be space-filled after the keyword"
+                )
             }
             Self::MissingExtensionType => {
                 write!(formatter, "extension HDU is missing the XTENSION keyword")
