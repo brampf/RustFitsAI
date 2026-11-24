@@ -73,6 +73,10 @@ Use `read_data_to()` for raw bytes or `read_data_values()` for individual
 values. The final checksum becomes available after the last byte of the HDU.
 Treat streamed output as provisional until the method succeeds.
 
+`Value::as_datetime()` accepts the same dates as the header reader. A FITS
+timestamp such as `2026-09-19T12:00:00` has no time zone. For compatibility,
+RustFitsAI also accepts `Z` and numeric offsets such as `+05:30`.
+
 ### Working with large files
 
 The default header limit is 1 MiB per HDU. Set `--max-header-bytes N` on the

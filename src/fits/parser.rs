@@ -4,7 +4,8 @@
 use std::io::{self, BufReader, Cursor, Read, Write};
 
 use super::{
-    Card, DataRepresentation, DataValue, FitsError, FitsFile, Hdu, HduIndex, Header, Value,
+    Card, DataRepresentation, DataValue, DateTime, FitsError, FitsFile, Hdu, HduIndex, Header,
+    Value,
 };
 
 /// Logical FITS block size from FITS 4.0 Sections 3.1-3.3.
@@ -1237,13 +1238,8 @@ fn is_integer_value(header: &Header, keyword: &str) -> bool {
 }
 
 fn validate_date_keyword(card: &Card) -> Result<(), FitsError> {
-    let Some(Value::String(value)) = card.value.as_ref() else {
-        return Err(FitsError::InvalidReservedValue {
-            keyword: card.keyword.clone(),
-            value: "expected a character string".to_string(),
-        });
-    };
-    if is_iso_date(value) || is_iso_datetime(value) || is_legacy_date(value) {
+    let value = reserved_string(card)?;
+    if DateTime::parse(value).is_some() {
         Ok(())
     } else {
         Err(FitsError::InvalidReservedValue {
@@ -1251,65 +1247,6 @@ fn validate_date_keyword(card: &Card) -> Result<(), FitsError> {
             value: value.to_string(),
         })
     }
-}
-
-fn is_iso_date(value: &str) -> bool {
-    let parts: Vec<_> = value.split('-').collect();
-    if parts.len() != 3
-        || parts[0].len() != 4
-        || parts[1].len() != 2
-        || parts[2].len() != 2
-        || !parts
-            .iter()
-            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-        return false;
-    }
-    let year = parts[0].parse::<u32>().ok();
-    let month = parts[1].parse::<u32>().ok();
-    let day = parts[2].parse::<u32>().ok();
-    matches!((year, month, day), (Some(year), Some(month), Some(day)) if (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day))
-}
-
-fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-fn is_iso_datetime(value: &str) -> bool {
-    let Some((date, time)) = value.split_once('T') else {
-        return false;
-    };
-    if !is_iso_date(date) {
-        return false;
-    }
-    let time = time.strip_suffix('Z').unwrap_or(time);
-    let parts: Vec<_> = time.split(':').collect();
-    if parts.len() != 3 || parts[0].len() != 2 || parts[1].len() != 2 {
-        return false;
-    }
-    let (seconds, fraction) = parts[2]
-        .split_once('.')
-        .map_or((parts[2], None), |(s, f)| (s, Some(f)));
-    parts[0].bytes().all(|byte| byte.is_ascii_digit())
-        && parts[1].bytes().all(|byte| byte.is_ascii_digit())
-        && seconds.len() == 2
-        && seconds.bytes().all(|byte| byte.is_ascii_digit())
-        && fraction.is_none_or(|fraction| {
-            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
-        })
-}
-
-fn is_legacy_date(value: &str) -> bool {
-    let parts: Vec<_> = value.split('/').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn indexed_axis(keyword: &str) -> Option<usize> {

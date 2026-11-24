@@ -3,7 +3,7 @@
 
 use std::io::Cursor;
 
-use rustfitsai::{BLOCK_SIZE, DataValue, FitsError, FitsFile, FitsReader, Value};
+use rustfitsai::{BLOCK_SIZE, DataValue, DateTime, FitsError, FitsFile, FitsReader, Value};
 
 fn card(text: &str) -> [u8; 80] {
     let mut result = [b' '; 80];
@@ -327,8 +327,93 @@ fn validates_datetime_and_unit_string_views() {
 
 #[test]
 fn rejects_invalid_datetime_and_control_character_units() {
-    assert!(rustfitsai::DateTime::parse("2026-09-19 12:34:56Z").is_none());
+    assert!(DateTime::parse("2026-09-19 12:34:56Z").is_none());
     assert!(rustfitsai::UnitString::parse("m\n").is_none());
+}
+
+fn observation_date_header(date: &str) -> Vec<u8> {
+    header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        &format!("DATE-OBS= '{date}'"),
+        "END",
+    ])
+}
+
+fn assert_valid_observation_date(date: &str) {
+    let file = FitsFile::from_bytes(&observation_date_header(date)).expect(date);
+    let value = file.hdus[0].header.cards[3].value.as_ref().unwrap();
+    assert_eq!(value.as_datetime().map(DateTime::as_str), Some(date));
+    assert_eq!(DateTime::parse(date).map(DateTime::as_str), Some(date));
+}
+
+fn assert_invalid_observation_date(date: &str) {
+    assert!(DateTime::parse(date).is_none(), "{date}");
+    assert!(
+        Value::String(date.to_owned()).as_datetime().is_none(),
+        "{date}"
+    );
+    assert!(
+        matches!(
+            FitsFile::from_bytes(&observation_date_header(date)),
+            Err(FitsError::InvalidReservedValue { keyword, value }) if keyword == "DATE-OBS" && value == date
+        ),
+        "{date}"
+    );
+}
+
+#[test]
+fn observation_date_accepts_a_timestamp_without_a_timezone() {
+    assert_valid_observation_date("2026-09-19T12:00:00");
+}
+
+#[test]
+fn observation_date_rejects_february_30() {
+    assert_invalid_observation_date("2026-02-30T12:00:00Z");
+    assert_invalid_observation_date("2026-02-30T12:00:00");
+}
+
+#[test]
+fn observation_date_rejects_hour_25() {
+    assert_invalid_observation_date("2026-09-19T25:00:00Z");
+    assert_invalid_observation_date("2026-09-19T25:00:00");
+}
+
+#[test]
+fn observation_date_accepts_calendar_dates_and_compatible_time_zones() {
+    for date in [
+        "2000-02-29",
+        "29/02/96",
+        "-04713-11-24T12:00:00",
+        "+12000-02-29",
+        "2026-09-19T12:34:56.125+05:30",
+        "2026-09-19T12:34:56-03:30",
+        "2026-09-19t12:34:56z",
+        "2016-12-31T23:59:60Z",
+        "2017-01-01T05:29:60.5+05:30",
+        "2026-09-19  ",
+    ] {
+        assert_valid_observation_date(date);
+    }
+}
+
+#[test]
+fn observation_date_checks_calendar_clock_and_offset_boundaries() {
+    for date in [
+        "1900-02-29",
+        "29/02/00",
+        "31/04/99",
+        "2026-09-19T12:60:00",
+        "2026-09-19T23:59:61",
+        "2026-09-19T12:00:60",
+        "2026-09-19T12:34:56.",
+        "2026-09-19T12:34:56+24:00",
+        "2026-09-19T12:34:56-03:60",
+        "2026-09-19T12:34:56+01:00Z",
+    ] {
+        assert_invalid_observation_date(date);
+    }
 }
 
 #[test]
@@ -482,18 +567,7 @@ fn validates_observation_and_bibliographic_keywords() {
 
 #[test]
 fn rejects_invalid_date_observation_value() {
-    let bytes = header(&[
-        "SIMPLE  =                    T",
-        "BITPIX  =                    8",
-        "NAXIS   =                    0",
-        "DATE-OBS= '2026-02-30'",
-        "END",
-    ]);
-
-    assert!(matches!(
-        FitsFile::from_bytes(&bytes),
-        Err(FitsError::InvalidReservedValue { keyword, .. }) if keyword == "DATE-OBS"
-    ));
+    assert_invalid_observation_date("2026-02-30");
 }
 
 #[test]

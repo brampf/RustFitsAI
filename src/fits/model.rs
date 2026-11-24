@@ -239,9 +239,8 @@ impl Value {
         }
     }
 
-    /// Interprets a string value as an ISO-8601 date/time without introducing
-    /// a FITS `Date` value type. FITS 4.0 Sections 4.2.7 and 9.1.1 define
-    /// datetime values as character strings.
+    /// Interprets a string value using the same rules as a FITS date keyword.
+    /// See [`DateTime::parse`] for the accepted forms.
     pub fn as_datetime(&self) -> Option<DateTime<'_>> {
         let value = match self {
             Self::String(value) => value,
@@ -262,74 +261,92 @@ impl Value {
     }
 }
 
-/// A validated ISO-8601 datetime string stored in a FITS character value.
-/// FITS 4.0 Section 4.2.7 defines this as a semantic string view, not a new
-/// FITS value datatype.
+/// A borrowed FITS calendar date with an optional time of day.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DateTime<'a>(&'a str);
 
 impl<'a> DateTime<'a> {
-    /// Validates and borrows an ISO-8601 date/time string.
+    /// Reads `YYYY-MM-DD` with an optional `Thh:mm:ss` and fractional seconds.
+    /// FITS 4.0 section 9.1.1 also allows a signed five-digit year. The older
+    /// `DD/MM/YY` form covers 1900 through 1999.
+    ///
+    /// FITS timestamps omit the time zone. For compatibility, the reader also
+    /// accepts `Z` and numeric offsets (`+hh:mm` or `-hh:mm`), as well as
+    /// lowercase `t` and `z`. Second 60 is allowed in the last minute of a UTC day.
     pub fn parse(value: &'a str) -> Option<Self> {
-        let (date, time) = value.split_once('T').or_else(|| value.split_once('t'))?;
-        let date_parts: Vec<_> = date.split('-').collect();
-        if date_parts.len() != 3
-            || date_parts[0].len() != 4
-            || date_parts[1].len() != 2
-            || date_parts[2].len() != 2
-            || !date_parts
-                .iter()
-                .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-        {
-            return None;
-        }
-
-        let (clock, timezone) =
-            if let Some(clock) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
-                (clock, "Z")
-            } else if let Some(index) = time.rfind(['+', '-']) {
-                (&time[..index], &time[index..])
+        let text = value.trim_end_matches(' ');
+        let (year, month, day) = if let Some((day, rest)) = text.split_once('/') {
+            let (month, year) = rest.split_once('/')?;
+            (1900 + decimal_field(year, 2)?, month, day)
+        } else {
+            let date = if let Some((date, time)) = text.split_once(['T', 't']) {
+                validate_clock(time)?;
+                date
             } else {
-                return None;
+                text
             };
-        let clock_parts: Vec<_> = clock.split(':').collect();
-        if clock_parts.len() != 3
-            || clock_parts[0].len() != 2
-            || clock_parts[1].len() != 2
-            || !clock_parts[0..2]
-                .iter()
-                .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-        {
-            return None;
-        }
-        let seconds =
-            clock_parts[2]
-                .split_once('.')
-                .map_or(clock_parts[2], |(seconds, fraction)| {
-                    if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
-                        ""
-                    } else {
-                        seconds
-                    }
-                });
-        if seconds.len() != 2 || !seconds.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        if timezone != "Z"
-            && (timezone.len() != 6
-                || !matches!(timezone.as_bytes()[0], b'+' | b'-')
-                || timezone.as_bytes()[3] != b':'
-                || !timezone[1..3].bytes().all(|byte| byte.is_ascii_digit())
-                || !timezone[4..].bytes().all(|byte| byte.is_ascii_digit()))
-        {
-            return None;
-        }
-        Some(Self(value))
+            let (year_month, day) = date.rsplit_once('-')?;
+            let (year, month) = year_month.rsplit_once('-')?;
+            let year = if year.len() == 6 && year.starts_with(['+', '-']) {
+                year.parse().ok()?
+            } else {
+                decimal_field(year, 4)?
+            };
+            (year, month, day)
+        };
+        let last_day = match decimal_field(month, 2)? {
+            2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            1..=12 => 31,
+            _ => return None,
+        };
+        (1..=last_day)
+            .contains(&decimal_field(day, 2)?)
+            .then_some(Self(value))
     }
 
+    /// Returns the original string, including any trailing FITS spaces.
     pub fn as_str(self) -> &'a str {
         self.0
     }
+}
+
+fn decimal_field(field: &str, width: usize) -> Option<i32> {
+    if field.len() != width || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
+}
+
+fn clock_minutes(value: &str) -> Option<i32> {
+    let (hour, minute) = value.split_once(':')?;
+    let hour = decimal_field(hour, 2)?;
+    let minute = decimal_field(minute, 2)?;
+    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+}
+
+fn validate_clock(time: &str) -> Option<()> {
+    let (clock, offset_minutes) = if let Some((clock, offset)) = time.split_once('+') {
+        (clock, clock_minutes(offset)?)
+    } else if let Some((clock, offset)) = time.split_once('-') {
+        (clock, -clock_minutes(offset)?)
+    } else {
+        (time.strip_suffix(['Z', 'z']).unwrap_or(time), 0)
+    };
+    let (hours_minutes, seconds) = clock.rsplit_once(':')?;
+    let local_minute = clock_minutes(hours_minutes)?;
+    let seconds = if let Some((seconds, fraction)) = seconds.split_once('.') {
+        if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        seconds
+    } else {
+        seconds
+    };
+    let second = decimal_field(seconds, 2)?;
+    let utc_minute = (local_minute - offset_minutes).rem_euclid(24 * 60);
+    (second < 60 || (second == 60 && utc_minute == 23 * 60 + 59)).then_some(())
 }
 
 /// A restricted-ASCII unit string as described by FITS 4.0 Section 4.3.
