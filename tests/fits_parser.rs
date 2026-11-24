@@ -235,16 +235,83 @@ fn reconstructs_continue_string_values() {
         "SIMPLE  =                    T",
         "BITPIX  =                    8",
         "NAXIS   =                    0",
-        "LONGKEY = 'first part&'",
-        "CONTINUE  'second part&'",
-        "CONTINUE  'last part'",
+        "",
+        "LONGKEY = 'This &  '",
+        "CONTINUE  'star''s &'",
+        "CONTINUE  'spectrum'",
         "END",
     ]);
 
     let file = FitsFile::from_bytes(&bytes).expect("continued strings should parse");
     assert_eq!(
         file.hdus[0].header.string_value("LONGKEY").as_deref(),
-        Some("first partsecond partlast part")
+        Some("This star's spectrum")
+    );
+}
+
+#[test]
+fn preserves_a_literal_ampersand_without_a_string_continuation() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "LABEL   = 'first&  '",
+        "CONTINUE  commentary",
+        "BADFORM = 'literal&'",
+        "CONTINUE..'ignored'",
+        "OBJECT  = 'R&D&'",
+        "END",
+    ]);
+    let file = FitsFile::from_bytes(&bytes).unwrap();
+    let header = &file.hdus[0].header;
+    assert_eq!(header.string_value("OBJECT").as_deref(), Some("R&D&"));
+    assert_eq!(header.string_value("LABEL").as_deref(), Some("first&  "));
+    assert_eq!(header.string_value("BADFORM").as_deref(), Some("literal&"));
+    assert_eq!(header.string_value("BITPIX"), None);
+    assert_eq!(header.string_value("MISSING"), None);
+}
+
+#[test]
+fn continues_strings_only_across_adjacent_physical_cards() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "LONGKEY = 'first&'",
+        "CONTINUE  ' part&'",
+        "",
+        "CONTINUE  'unrelated'",
+        "NEXTKEY = 'second&'",
+        "CONTINUE  ' part'",
+        "END",
+    ]);
+    let file = FitsFile::from_bytes(&bytes).unwrap();
+    let header = &file.hdus[0].header;
+    assert_eq!(
+        header.string_value("LONGKEY").as_deref(),
+        Some("first part&")
+    );
+    assert_eq!(
+        header.string_value("NEXTKEY").as_deref(),
+        Some("second part")
+    );
+}
+
+#[test]
+fn an_empty_final_substring_ends_a_continuation_chain() {
+    let bytes = header(&[
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "LONGKEY = 'R&D&&'",
+        "CONTINUE  ''",
+        "CONTINUE  'unrelated'",
+        "END",
+    ]);
+    let file = FitsFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.hdus[0].header.string_value("LONGKEY").as_deref(),
+        Some("R&D&")
     );
 }
 
@@ -615,19 +682,61 @@ fn rejects_array_keywords_in_non_array_extensions() {
 }
 
 #[test]
-fn requires_bscale_and_bzero_together() {
-    let bytes = header(&[
+fn reads_images_with_an_independent_scale_or_offset() {
+    let mut bytes = header(&[
         "SIMPLE  =                    T",
-        "BITPIX  =                    8",
-        "NAXIS   =                    0",
-        "BSCALE  =                  1.0",
+        "BITPIX  =                   16",
+        "NAXIS   =                    1",
+        "NAXIS1  =                    1",
+        "EXTEND  =                    T",
+        "BZERO   =                32768",
         "END",
     ]);
+    bytes.extend_from_slice(&[0, 1]);
+    bytes.resize(2 * BLOCK_SIZE, 0);
+    bytes.extend(header(&[
+        "XTENSION= 'IMAGE   '",
+        "BITPIX  =                   16",
+        "NAXIS   =                    1",
+        "NAXIS1  =                    1",
+        "PCOUNT  =                    0",
+        "GCOUNT  =                    1",
+        "BSCALE  =                  2.5",
+        "END",
+    ]));
+    bytes.extend_from_slice(&[0, 2]);
+    bytes.resize(4 * BLOCK_SIZE, 0);
 
-    assert!(matches!(
-        FitsFile::from_bytes(&bytes),
-        Err(FitsError::InvalidArrayKeyword { keyword, .. }) if keyword == "BSCALE"
-    ));
+    let file = FitsFile::from_bytes(&bytes).unwrap();
+    assert_eq!(file.hdus[0].header.value("BZERO"), Some("32768"));
+    assert_eq!(file.hdus[0].data, [0, 1]);
+    assert_eq!(file.hdus[1].header.value("BSCALE"), Some("2.5"));
+    assert_eq!(file.hdus[1].data, [0, 2]);
+}
+
+#[test]
+fn rejects_nonnumeric_image_scaling_cards() {
+    for (keyword, invalid) in [
+        ("BSCALE", "BSCALE  = 'two'"),
+        ("BZERO", "BZERO   =                    T"),
+    ] {
+        let bytes = header(&[
+            "SIMPLE  =                    T",
+            "BITPIX  =                   16",
+            "NAXIS   =                    0",
+            "BSCALE  =                  1.0",
+            "BZERO   =                    0",
+            invalid,
+            "END",
+        ]);
+        assert!(
+            matches!(
+                FitsFile::from_bytes(&bytes),
+                Err(FitsError::InvalidArrayKeyword { keyword: actual, .. }) if actual == keyword
+            ),
+            "{keyword}"
+        );
+    }
 }
 
 #[test]

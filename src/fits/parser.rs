@@ -991,10 +991,6 @@ fn validate_random_groups_keywords(header: &Header, naxis: usize) -> Result<(), 
         });
     }
     let parameter_count = keyword_usize(header, "PCOUNT")?;
-    const PSCAL: u8 = 1;
-    const PZERO: u8 = 2;
-    // A parameter keyword has a five-byte prefix and at most three index digits.
-    let mut scaling = [0_u8; 1000];
     for card in &header.cards {
         let prefix = card.keyword.get(..5).unwrap_or("");
         let suffix = card.keyword.get(5..).unwrap_or("");
@@ -1012,28 +1008,14 @@ fn validate_random_groups_keywords(header: &Header, naxis: usize) -> Result<(), 
                 keyword: card.keyword.clone(),
             });
         }
-        match (prefix, &card.value) {
-            ("PTYPE", value) => validate_string_value(&card.keyword, value.as_ref())?,
-            ("PSCAL" | "PZERO", Some(Value::Integer(_) | Value::Real(_))) => {
-                scaling[index] |= if prefix == "PSCAL" { PSCAL } else { PZERO };
-            }
-            ("PSCAL" | "PZERO", _) => {
-                return Err(FitsError::InvalidReservedValue {
-                    keyword: card.keyword.clone(),
-                    value: "expected a floating-point value".to_string(),
-                });
-            }
-            _ => unreachable!(),
+        if prefix == "PTYPE" {
+            validate_string_value(&card.keyword, card.value.as_ref())?;
+        } else if !matches!(card.value, Some(Value::Integer(_) | Value::Real(_))) {
+            return Err(FitsError::InvalidReservedValue {
+                keyword: card.keyword.clone(),
+                value: "expected a floating-point value".to_string(),
+            });
         }
-    }
-    if let Some(index) = scaling
-        .iter()
-        .position(|flags| matches!(*flags, PSCAL | PZERO))
-    {
-        return Err(FitsError::InvalidReservedValue {
-            keyword: format!("PSCAL{index}"),
-            value: "PSCALn and PZEROn must be used together".to_string(),
-        });
     }
     Ok(())
 }
@@ -1054,18 +1036,12 @@ fn validate_array_keywords(header: &Header, primary: bool) -> Result<(), FitsErr
         return Ok(());
     }
 
-    let has_bscale = header.cards.iter().any(|card| card.keyword == "BSCALE");
-    let has_bzero = header.cards.iter().any(|card| card.keyword == "BZERO");
-    if has_bscale != has_bzero {
-        return Err(FitsError::InvalidArrayKeyword {
-            keyword: if has_bscale { "BSCALE" } else { "BZERO" }.to_string(),
-            message: "BSCALE and BZERO must be used together".to_string(),
-        });
-    }
-    for keyword in ["BSCALE", "BZERO"] {
-        if has_bscale && !is_real_value(header, keyword) {
+    for card in &header.cards {
+        if matches!(card.keyword.as_str(), "BSCALE" | "BZERO")
+            && !matches!(card.value, Some(Value::Integer(_) | Value::Real(_)))
+        {
             return Err(FitsError::InvalidArrayKeyword {
-                keyword: keyword.to_string(),
+                keyword: card.keyword.clone(),
                 message: "expected a floating-point value".to_string(),
             });
         }
@@ -1323,14 +1299,9 @@ fn validate_string_value(keyword: &str, value: Option<&Value>) -> Result<(), Fit
 
 fn raw_card<'a>(header: &'a Header, keyword: &str) -> Result<&'a [u8], FitsError> {
     header
-        .raw_cards
-        .iter()
-        .find(|card| {
-            card.as_bytes()
-                .get(..8)
-                .is_some_and(|field| String::from_utf8_lossy(field).trim() == keyword)
-        })
-        .map(|card| card.as_bytes())
+        .raw_cards_from(keyword)
+        .next()
+        .map(str::as_bytes)
         .ok_or_else(|| FitsError::MissingMandatoryKeyword {
             keyword: keyword.to_string(),
         })

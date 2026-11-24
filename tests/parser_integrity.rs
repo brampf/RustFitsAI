@@ -393,34 +393,50 @@ fn readers_stop_after_partial_writes_or_reads() {
 
 #[test]
 fn validates_only_supplied_random_group_parameter_cards() {
-    let mut cards = vec![
-        EMPTY_PRIMARY[0],
-        "BITPIX  =                   16",
-        "NAXIS   =                    2",
-        "NAXIS1  =                    0",
-        "NAXIS2  =                    1",
-        "GROUPS  =                    T",
-        "PCOUNT  =                 1000",
-        "GCOUNT  =                    1",
-        "PTYPE999= 'WEIGHT  '",
-        "PSCAL999=                  1.0",
-        "PZERO999=                  0.0",
-        "END",
-    ];
-    let mut data = header(&cards);
-    data.resize(BLOCK_SIZE * 2, 0);
-    assert_eq!(
-        FitsFile::from_bytes(&data).unwrap().hdus[0].data.len(),
-        2002
-    );
+    let group_header = |count: usize, parameter: &str| {
+        header(&[
+            EMPTY_PRIMARY[0],
+            "BITPIX  =                   16",
+            "NAXIS   =                    2",
+            "NAXIS1  =                    0",
+            "NAXIS2  =                    1",
+            "GROUPS  =                    T",
+            &format!("PCOUNT  = {count:>20}"),
+            "GCOUNT  =                    1",
+            parameter,
+            "END",
+        ])
+    };
+    for (keyword, parameter) in [
+        ("PTYPE999", "PTYPE999= 'WEIGHT  '"),
+        ("PSCAL999", "PSCAL999=                  2.5"),
+        ("PZERO999", "PZERO999=                    4"),
+    ] {
+        let mut data = group_header(1000, parameter);
+        data.resize(BLOCK_SIZE * 2, 0);
+        assert_eq!(
+            FitsFile::from_bytes(&data).unwrap().hdus[0].data.len(),
+            2002
+        );
+        assert!(
+            matches!(
+                FitsFile::from_bytes(&group_header(998, parameter)),
+                Err(FitsError::InvalidReservedPlacement { keyword: actual }) if actual == keyword
+            ),
+            "{keyword}"
+        );
+    }
 
-    cards.remove(10);
-    assert!(
-        matches!(FitsFile::from_bytes(&header(&cards)), Err(FitsError::InvalidReservedValue { keyword, .. }) if keyword == "PSCAL999")
-    );
-
-    cards[6] = "PCOUNT  =                  998";
-    assert!(
-        matches!(FitsFile::from_bytes(&header(&cards)), Err(FitsError::InvalidReservedPlacement { keyword }) if keyword == "PTYPE999")
-    );
+    for (keyword, parameter) in [
+        ("PSCAL999", "PSCAL999= 'bad'"),
+        ("PZERO999", "PZERO999=                    T"),
+    ] {
+        assert!(
+            matches!(
+                FitsFile::from_bytes(&group_header(1000, parameter)),
+                Err(FitsError::InvalidReservedValue { keyword: actual, .. }) if actual == keyword
+            ),
+            "{keyword}"
+        );
+    }
 }

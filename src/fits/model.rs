@@ -169,39 +169,43 @@ impl Header {
 
     /// Reconstructs a single-record or `CONTINUE`-extended string value.
     ///
-    /// This follows FITS 4.0 Section 4.2.1.2: a trailing `&` is removed only
-    /// when the next card is a conforming `CONTINUE` string record.
+    /// A trailing `&` marks a continuation only when the next physical card
+    /// is a `CONTINUE` string record (FITS 4.0 Section 4.2.1.2).
     pub fn string_value(&self, keyword: &str) -> Option<String> {
-        let start = self.cards.iter().position(|card| card.keyword == keyword)?;
-        let mut value = match self.cards[start].value.as_ref()? {
-            Value::String(value) => value.clone(),
-            Value::Logical(_)
-            | Value::Integer(_)
-            | Value::Real(_)
-            | Value::ComplexInteger(_)
-            | Value::ComplexReal(_)
-            | Value::Undefined => return None,
+        let mut cards = self.cards.iter();
+        let first = cards.find(|card| card.keyword == keyword)?;
+        let Some(Value::String(first_part)) = &first.value else {
+            return None;
         };
-        let mut index = start + 1;
-        while value.ends_with('&') {
-            let continuation = self.cards.get(index)?;
-            if continuation.keyword != "CONTINUE" {
+        let mut part = first_part.as_str();
+        let mut value = String::new();
+        // Parsed cards omit blank records, which interrupt a continuation.
+        let mut raw_continuations = self
+            .raw_cards_from(keyword)
+            .skip(1)
+            .take_while(|record| record.starts_with("CONTINUE  "));
+        for card in cards.take_while(|card| card.keyword == "CONTINUE") {
+            let Some(prefix) = part.trim_end_matches(' ').strip_suffix('&') else {
+                break;
+            };
+            let Some(Value::String(next)) = &card.value else {
+                break;
+            };
+            if !self.raw_cards.is_empty() && raw_continuations.next().is_none() {
                 break;
             }
-            let part = match continuation.value.as_ref()? {
-                Value::String(part) => part,
-                Value::Logical(_)
-                | Value::Integer(_)
-                | Value::Real(_)
-                | Value::ComplexInteger(_)
-                | Value::ComplexReal(_)
-                | Value::Undefined => break,
-            };
-            value.pop();
-            value.push_str(part);
-            index += 1;
+            value.push_str(prefix);
+            part = next;
         }
+        value.push_str(part);
         Some(value)
+    }
+
+    pub(super) fn raw_cards_from<'a>(&'a self, keyword: &str) -> impl Iterator<Item = &'a str> {
+        self.raw_cards
+            .iter()
+            .map(String::as_str)
+            .skip_while(move |card| card.get(..8).map(str::trim_end) != Some(keyword))
     }
 }
 

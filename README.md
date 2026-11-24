@@ -73,7 +73,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 ```
 
 Use `read_data_to()` for raw bytes or `read_data_values()` for individual
-values. The final checksum becomes available after the last byte of the HDU.
+values. By default the reader verifies any supplied checksum after reading
+the data and its padding.
 Treat streamed output as provisional until the method succeeds.
 
 `Value::as_datetime()` accepts the same dates as the header reader. A FITS
