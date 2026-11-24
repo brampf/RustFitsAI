@@ -439,7 +439,7 @@ fn parse_header<R: Read>(
     let mut raw_cards = Vec::new();
     let mut raw_bytes = Vec::new();
     let mut header_size = 0;
-    let mut block = [0_u8; BLOCK_SIZE];
+    let mut block = [[0_u8; CARD_SIZE]; BLOCK_SIZE / CARD_SIZE];
 
     loop {
         let next_size = checked_add(header_size, BLOCK_SIZE, "header size")?;
@@ -447,15 +447,16 @@ fn parse_header<R: Read>(
         if owned_remaining.is_some_and(|remaining| next_size > remaining) {
             return Err(limit_error("owned FITS read", limits.max_owned_bytes));
         }
-        block[..prefix.len()].copy_from_slice(prefix);
+        let bytes = block.as_flattened_mut();
+        bytes[..prefix.len()].copy_from_slice(prefix);
         reader
-            .read_exact(&mut block[prefix.len()..])
+            .read_exact(&mut bytes[prefix.len()..])
             .map_err(io_error)?;
         prefix = &[];
-        raw_bytes.extend_from_slice(&block);
+        raw_bytes.extend_from_slice(bytes);
         header_size = next_size;
         let mut found_end = false;
-        for card_bytes in block.chunks_exact(CARD_SIZE) {
+        for card_bytes in &block {
             if card_bytes.iter().any(|byte| !(32..=126).contains(byte)) {
                 return Err(FitsError::InvalidHeader {
                     offset: header_size - BLOCK_SIZE,
@@ -573,16 +574,12 @@ impl OnesComplement {
             self.sum = fold_sum(self.sum, u32::from_be_bytes(self.tail));
             bytes = &bytes[take..];
         }
-        let mut words = bytes.chunks_exact(4);
-        for word in &mut words {
-            self.sum = fold_sum(
-                self.sum,
-                u32::from_be_bytes([word[0], word[1], word[2], word[3]]),
-            );
+        while let Some((word, rest)) = bytes.split_first_chunk::<4>() {
+            self.sum = fold_sum(self.sum, u32::from_be_bytes(*word));
+            bytes = rest;
         }
-        let remainder = words.remainder();
-        self.tail_len = remainder.len();
-        self.tail[..self.tail_len].copy_from_slice(remainder);
+        self.tail_len = bytes.len();
+        self.tail[..self.tail_len].copy_from_slice(bytes);
     }
 
     fn finish(mut self) -> u32 {
@@ -734,10 +731,8 @@ fn is_real(value: &str) -> bool {
         .map_or((value, None), |(mantissa, exponent)| {
             (mantissa, Some(exponent))
         });
-    if let Some(exponent) = exponent {
-        if !is_integer(exponent) {
-            return false;
-        }
+    if exponent.is_some_and(|exponent| !is_integer(exponent)) {
+        return false;
     }
     if let Some((integer, fraction)) = mantissa.split_once('.') {
         return (!integer.is_empty() || !fraction.is_empty())
@@ -933,12 +928,10 @@ fn validate_header(header: &Header, primary: bool) -> Result<IntegrityKeywords, 
         validate_fixed_integer(header, "GCOUNT")?;
     }
     for keyword in keywords() {
-        if let Some(axis) = indexed_axis(keyword) {
-            if axis == 0 || axis > naxis {
-                return Err(FitsError::InvalidKeywordOrder {
-                    keyword: keyword.to_string(),
-                });
-            }
+        if indexed_axis(keyword).is_some_and(|axis| axis == 0 || axis > naxis) {
+            return Err(FitsError::InvalidKeywordOrder {
+                keyword: keyword.to_string(),
+            });
         }
     }
     Ok(integrity)
@@ -1046,16 +1039,16 @@ fn validate_array_keywords(header: &Header, primary: bool) -> Result<(), FitsErr
             });
         }
     }
-    if header.cards.iter().any(|card| card.keyword == "BUNIT") {
-        if card_value(header, "BUNIT")
-            .and_then(Value::as_unit)
-            .is_none()
-        {
-            return Err(FitsError::InvalidArrayKeyword {
-                keyword: "BUNIT".to_string(),
-                message: "expected a valid unit string".to_string(),
-            });
-        }
+    if header
+        .cards
+        .iter()
+        .find(|card| card.keyword == "BUNIT")
+        .is_some_and(|card| card.value.as_ref().and_then(Value::as_unit).is_none())
+    {
+        return Err(FitsError::InvalidArrayKeyword {
+            keyword: "BUNIT".to_string(),
+            message: "expected a valid unit string".to_string(),
+        });
     }
     if header.cards.iter().any(|card| card.keyword == "BLANK") {
         let bitpix = header
@@ -1095,13 +1088,14 @@ fn validate_extension_keywords(header: &Header, primary: bool) -> Result<(), Fit
             });
         }
     }
-    if let Some(value) = header.value("EXTLEVEL") {
-        if value.parse::<i64>().ok().is_none_or(|value| value < 1) {
-            return Err(FitsError::InvalidReservedValue {
-                keyword: "EXTLEVEL".to_string(),
-                value: value.to_string(),
-            });
-        }
+    if let Some(value) = header
+        .value("EXTLEVEL")
+        .filter(|value| value.parse::<i64>().ok().is_none_or(|level| level < 1))
+    {
+        return Err(FitsError::InvalidReservedValue {
+            keyword: "EXTLEVEL".to_string(),
+            value: value.to_string(),
+        });
     }
     if header.cards.iter().any(|card| card.keyword == "INHERIT") {
         if primary {
