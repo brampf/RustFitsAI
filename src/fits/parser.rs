@@ -1,7 +1,7 @@
 // Copyright (c) 2026 May
 // SPDX-License-Identifier: MIT
 
-use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 
 use super::{
     Card, DataRepresentation, DataValue, FitsError, FitsFile, Hdu, HduIndex, Header, Value,
@@ -13,47 +13,92 @@ pub const BLOCK_SIZE: usize = 2880;
 pub const CARD_SIZE: usize = 80;
 const IO_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Limits on the FITS bytes retained by the reader and owned parsing methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FitsLimits {
+    /// Original bytes per header, including padding to a complete FITS block.
+    /// Defaults to 1 MiB.
+    pub max_header_bytes: usize,
+    /// Bytes retained by an owned read. Defaults to 256 MiB.
+    ///
+    /// [`FitsReader::read_data`] counts unpadded payload bytes and
+    /// [`FitsReader::read_special_records`] counts complete special records.
+    /// [`FitsFile::from_bytes_with_limits`] counts these across the whole file,
+    /// including original header bytes. Parsed cards and container overhead
+    /// use additional memory. This limit does not apply when streaming data or
+    /// special records.
+    pub max_owned_bytes: usize,
+}
+
+impl Default for FitsLimits {
+    fn default() -> Self {
+        Self {
+            max_header_bytes: 1024 * 1024,
+            max_owned_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 /// Sequential, buffered FITS reader.
 ///
-/// `FitsReader` keeps only a bounded I/O buffer and the current Header Unit in
-/// memory. Callers must consume or skip the current Data Unit before requesting
+/// `FitsReader` buffers input and parses headers one at a time. Callers must
+/// consume or skip the current Data Unit before requesting
 /// the next HDU. This matches the ordered structure required by FITS 4.0
 /// Sections 3.1 and 3.2 and avoids allocating very large Data Units.
+/// Header, data, and special-record parsing or I/O errors stop the reader.
+/// Subsequent operations then return [`FitsError::ReaderFailed`]. Call-order
+/// errors and owned Data Unit size or allocation errors leave the reader usable.
 pub struct FitsReader<R> {
     reader: BufReader<R>,
     first_hdu: bool,
     pending_data: Option<PendingData>,
     at_special_records: bool,
+    special_prefix: [u8; 8],
+    special_prefix_len: usize,
     lax_checksums: bool,
+    limits: FitsLimits,
+    failed: bool,
 }
 
 struct PendingData {
     size: usize,
     padded_size: usize,
     datasum: Option<u32>,
-    checksum_header: Option<Vec<u8>>,
+    header_sum: Option<u32>,
     representation: super::DataRepresentation,
 }
 
 impl<R: Read> FitsReader<R> {
-    /// Creates a reader with a bounded internal buffer over any `Read` source.
+    /// Creates a strict reader with the default [`FitsLimits`].
     pub fn new(reader: R) -> Self {
+        Self::with_lax_and_limits(reader, false, FitsLimits::default())
+    }
+
+    /// Creates a reader with default limits and optional lax checksum handling.
+    /// Lax mode skips checksum accumulation and comparisons. Structural and
+    /// keyword validation, including `DATASUM` syntax and range, remain active.
+    pub fn with_lax(reader: R, lax_checksums: bool) -> Self {
+        Self::with_lax_and_limits(reader, lax_checksums, FitsLimits::default())
+    }
+
+    /// Creates a strict reader with custom limits.
+    pub fn with_limits(reader: R, limits: FitsLimits) -> Self {
+        Self::with_lax_and_limits(reader, false, limits)
+    }
+
+    /// Creates a reader with custom limits and optional lax checksum handling.
+    pub fn with_lax_and_limits(reader: R, lax_checksums: bool, limits: FitsLimits) -> Self {
         Self {
             reader: BufReader::with_capacity(IO_BUFFER_SIZE, reader),
             first_hdu: true,
             pending_data: None,
             at_special_records: false,
-            lax_checksums: false,
+            special_prefix: [0; 8],
+            special_prefix_len: 0,
+            lax_checksums,
+            limits,
+            failed: false,
         }
-    }
-
-    /// Creates a reader with optional `DATASUM`/`CHECKSUM` validation disabled.
-    /// Lax mode also skips checksum accumulation, but structural and keyword
-    /// validation remains active.
-    pub fn with_lax(reader: R, lax_checksums: bool) -> Self {
-        let mut result = Self::new(reader);
-        result.lax_checksums = lax_checksums;
-        result
     }
 
     /// Parses the next primary or conforming extension header.
@@ -62,37 +107,64 @@ impl<R: Read> FitsReader<R> {
     /// `None` indicates that the reader reached the special-record section or
     /// logical end of the FITS stream. See FITS 4.0 Sections 3.4 and 3.5.
     pub fn next_hdu(&mut self) -> Result<Option<HduIndex>, FitsError> {
+        self.next_hdu_with_budget(None)
+    }
+
+    fn next_hdu_with_budget(
+        &mut self,
+        owned_remaining: Option<usize>,
+    ) -> Result<Option<HduIndex>, FitsError> {
+        self.check_usable()?;
         if self.pending_data.is_some() {
             return Err(FitsError::DataPending);
         }
         if self.at_special_records {
             return Ok(None);
         }
+        self.failed = true;
+        let next_hdu = self.parse_next_hdu(owned_remaining)?;
+        self.failed = false;
+        Ok(next_hdu)
+    }
 
+    fn parse_next_hdu(
+        &mut self,
+        owned_remaining: Option<usize>,
+    ) -> Result<Option<HduIndex>, FitsError> {
         if !self.first_hdu {
-            let prefix = self.reader.fill_buf().map_err(io_error)?;
-            if prefix.is_empty() || prefix.len() < 8 || &prefix[..8] != b"XTENSION" {
+            let filled = read_up_to(&mut self.reader, &mut self.special_prefix)?;
+            if filled < self.special_prefix.len() || &self.special_prefix != b"XTENSION" {
+                self.special_prefix_len = filled;
                 self.at_special_records = true;
                 return Ok(None);
             }
         }
 
-        let header = parse_header(&mut self.reader)?;
-        validate_header(&header, self.first_hdu)?;
+        let prefix = if self.first_hdu {
+            &[][..]
+        } else {
+            &self.special_prefix[..]
+        };
+        let header = parse_header(&mut self.reader, prefix, self.limits, owned_remaining)?;
+        let integrity = validate_header(&header, self.first_hdu)?;
         let data_size = data_size(&header, self.first_hdu)?;
         let padded_size = padded_size(data_size)?;
-        let datasum = header
-            .value("DATASUM")
-            .and_then(|value| value.trim().parse().ok());
-        let checksum_header = card_value(&header, "CHECKSUM")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(|_| header.raw_bytes.clone());
+        let header_sum = if !self.lax_checksums && integrity.has_checksum {
+            let mut checksum = OnesComplement::default();
+            checksum.update(&header.raw_bytes);
+            Some(checksum.finish())
+        } else {
+            None
+        };
         self.pending_data = Some(PendingData {
             size: data_size,
             padded_size,
-            datasum,
-            checksum_header,
+            datasum: if self.lax_checksums {
+                None
+            } else {
+                integrity.datasum
+            },
+            header_sum,
             representation: DataRepresentation::from_bitpix(header.value("BITPIX").unwrap())
                 .expect("validated BITPIX has a data representation"),
         });
@@ -105,35 +177,43 @@ impl<R: Read> FitsReader<R> {
     ///
     /// This is the preferred method for very large Data Units. FITS padding is
     /// defined by the 2880-byte blocking rules in Sections 3.1, 3.2, and 3.6.
-    /// In strict mode the streamed bytes and padding also feed `DATASUM` and
-    /// `CHECKSUM` validation; lax mode avoids that additional CPU work.
+    /// If strict mode has a nonblank `DATASUM` or `CHECKSUM`, verification
+    /// includes the payload and its padding.
+    /// Treat bytes written as provisional until this method succeeds.
     pub fn read_data_to<W: Write>(&mut self, mut writer: W) -> Result<(), FitsError> {
-        let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
+        let pending = self.take_pending_data()?;
         let padding = pending.padded_size - pending.size;
-        if self.lax_checksums {
-            copy_exact(&mut self.reader, &mut writer, pending.size)?;
-            copy_exact(&mut self.reader, &mut io::sink(), padding)?;
-        } else {
-            let mut checksum = OnesComplement::default();
-            copy_exact_checksum(&mut self.reader, &mut writer, pending.size, &mut checksum)?;
-            copy_exact_checksum(&mut self.reader, &mut io::sink(), padding, &mut checksum)?;
-            let data_sum = checksum.finish();
-            validate_data_checksum(pending.datasum, data_sum)?;
-            validate_hdu_checksum(pending.checksum_header.as_deref(), data_sum)?;
-        }
+        let mut checksum = pending.checksum();
+        copy_exact(
+            &mut self.reader,
+            &mut writer,
+            pending.size,
+            checksum.as_mut(),
+        )?;
+        copy_exact(
+            &mut self.reader,
+            &mut io::sink(),
+            padding,
+            checksum.as_mut(),
+        )?;
+        pending.validate_checksums(checksum)?;
+        self.failed = false;
         Ok(())
     }
 
     /// Reads the current Data Unit into memory on explicit request.
     ///
     /// Prefer [`FitsReader::read_data_to`] or [`FitsReader::skip_data`] when the
-    /// Data Unit may be large.
+    /// Data Unit may be large. An owned size limit or allocation failure leaves
+    /// the Data Unit pending so it can still be streamed or skipped.
     pub fn read_data(&mut self) -> Result<Vec<u8>, FitsError> {
+        self.check_usable()?;
         let size = self
             .pending_data
             .as_ref()
             .ok_or(FitsError::NoPendingData)?
             .size;
+        check_limit(size, self.limits.max_owned_bytes, "owned data")?;
         let mut data = Vec::new();
         data.try_reserve_exact(size)
             .map_err(|_| FitsError::SizeOverflow {
@@ -149,11 +229,12 @@ impl<R: Read> FitsReader<R> {
     /// allocate the Data Unit. `BITPIX=8` is exposed as [`DataValue::Byte`];
     /// callers may validate the high bit when using the bytes as ASCII as
     /// required by FITS 5.1.
+    /// Treat values delivered to the callback as provisional until success.
     pub fn read_data_values<F>(&mut self, mut callback: F) -> Result<(), FitsError>
     where
         F: FnMut(DataValue),
     {
-        let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
+        let pending = self.take_pending_data()?;
         let width = match pending.representation {
             super::DataRepresentation::Byte => 1,
             super::DataRepresentation::Integer16 => 2,
@@ -167,22 +248,41 @@ impl<R: Read> FitsReader<R> {
             });
         }
         let padding = pending.padded_size - pending.size;
-        let mut checksum = OnesComplement::default();
+        let mut checksum = pending.checksum();
         let mut value = [0_u8; 8];
         for _ in 0..pending.size / width {
             self.reader
                 .read_exact(&mut value[..width])
                 .map_err(io_error)?;
-            checksum.update(&value[..width]);
+            if let Some(checksum) = &mut checksum {
+                checksum.update(&value[..width]);
+            }
             callback(decode_value(pending.representation, &value));
         }
-        copy_exact_checksum(&mut self.reader, &mut io::sink(), padding, &mut checksum)?;
-        if !self.lax_checksums {
-            let data_sum = checksum.finish();
-            validate_data_checksum(pending.datasum, data_sum)?;
-            validate_hdu_checksum(pending.checksum_header.as_deref(), data_sum)?;
-        }
+        copy_exact(
+            &mut self.reader,
+            &mut io::sink(),
+            padding,
+            checksum.as_mut(),
+        )?;
+        pending.validate_checksums(checksum)?;
+        self.failed = false;
         Ok(())
+    }
+
+    fn check_usable(&self) -> Result<(), FitsError> {
+        if self.failed {
+            Err(FitsError::ReaderFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn take_pending_data(&mut self) -> Result<PendingData, FitsError> {
+        self.check_usable()?;
+        let pending = self.pending_data.take().ok_or(FitsError::NoPendingData)?;
+        self.failed = true;
+        Ok(pending)
     }
 
     /// Consumes the current Data Unit without retaining its bytes.
@@ -194,11 +294,26 @@ impl<R: Read> FitsReader<R> {
     ///
     /// Special records are restricted-use 2880-byte blocks as described in
     /// FITS 4.0 Section 3.5. Use [`FitsReader::copy_special_records_to`] for a
-    /// streaming alternative.
+    /// streaming alternative. Exceeding the owned size limit stops the reader.
     pub fn read_special_records(&mut self) -> Result<Vec<Vec<u8>>, FitsError> {
-        let mut bytes = Vec::new();
-        self.copy_special_records_to(&mut bytes)?;
-        Ok(bytes.chunks_exact(BLOCK_SIZE).map(Vec::from).collect())
+        self.read_special_records_with_budget(self.limits.max_owned_bytes)
+    }
+
+    fn read_special_records_with_budget(
+        &mut self,
+        mut owned_remaining: usize,
+    ) -> Result<Vec<Vec<u8>>, FitsError> {
+        self.start_special_records()?;
+        let mut records = Vec::new();
+        let mut record = [0_u8; BLOCK_SIZE];
+        while self.next_special_record(&mut record, records.len())? {
+            owned_remaining = owned_remaining
+                .checked_sub(BLOCK_SIZE)
+                .ok_or_else(|| limit_error("owned FITS read", self.limits.max_owned_bytes))?;
+            records.push(record.to_vec());
+        }
+        self.failed = false;
+        Ok(records)
     }
 
     /// Streams trailing special records to `writer` and returns their count.
@@ -206,50 +321,106 @@ impl<R: Read> FitsReader<R> {
     /// The first eight bytes of each record are checked against the `XTENSION`
     /// restriction in FITS 4.0 Section 3.5. A partial physical tail is ignored
     /// as permitted by the physical-blocking rules in Section 3.6.1.
+    /// Treat bytes written as provisional until this method succeeds.
     pub fn copy_special_records_to<W: Write>(&mut self, mut writer: W) -> Result<usize, FitsError> {
-        if !self.at_special_records {
-            return Err(FitsError::SpecialRecordsNotReady);
-        }
-
+        self.start_special_records()?;
         let mut record = [0_u8; BLOCK_SIZE];
         let mut count = 0;
-        loop {
-            let mut filled = 0;
-            while filled < BLOCK_SIZE {
-                let bytes_read = self.reader.read(&mut record[filled..]).map_err(io_error)?;
-                if bytes_read == 0 {
-                    return Ok(count);
-                }
-                filled += bytes_read;
-            }
-            if &record[..8] == b"XTENSION" {
-                return Err(FitsError::InvalidSpecialRecords {
-                    offset: count * BLOCK_SIZE,
-                    message: "the first eight bytes must not contain XTENSION".to_string(),
-                });
-            }
+        while self.next_special_record(&mut record, count)? {
             writer.write_all(&record).map_err(io_error)?;
             count += 1;
         }
+        self.failed = false;
+        Ok(count)
+    }
+
+    fn start_special_records(&mut self) -> Result<(), FitsError> {
+        self.check_usable()?;
+        if !self.at_special_records {
+            return Err(FitsError::SpecialRecordsNotReady);
+        }
+        self.failed = true;
+        Ok(())
+    }
+
+    fn next_special_record(
+        &mut self,
+        record: &mut [u8; BLOCK_SIZE],
+        count: usize,
+    ) -> Result<bool, FitsError> {
+        let prefix_len = std::mem::take(&mut self.special_prefix_len);
+        record[..prefix_len].copy_from_slice(&self.special_prefix[..prefix_len]);
+        let read = read_up_to(&mut self.reader, &mut record[prefix_len..])?;
+        if read + prefix_len < BLOCK_SIZE {
+            return Ok(false);
+        }
+        if &record[..8] == b"XTENSION" {
+            return Err(FitsError::InvalidSpecialRecords {
+                offset: count.saturating_mul(BLOCK_SIZE),
+                message: "the first eight bytes must not contain XTENSION".to_string(),
+            });
+        }
+        Ok(true)
+    }
+}
+
+impl PendingData {
+    fn checksum(&self) -> Option<OnesComplement> {
+        (self.datasum.is_some() || self.header_sum.is_some()).then(OnesComplement::default)
+    }
+
+    fn validate_checksums(self, checksum: Option<OnesComplement>) -> Result<(), FitsError> {
+        if let Some(checksum) = checksum {
+            let data_sum = checksum.finish();
+            validate_data_checksum(self.datasum, data_sum)?;
+            validate_hdu_checksum(self.header_sum, data_sum)?;
+        }
+        Ok(())
     }
 }
 
 impl FitsFile {
+    /// Parses a complete FITS slice with strict checksum handling and default limits.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FitsError> {
+        Self::from_bytes_with_limits(bytes, FitsLimits::default())
+    }
+
+    /// Parses a complete FITS slice using strict checksums and custom limits.
+    ///
+    /// The owned budget includes the bytes retained for every header, unpadded
+    /// data payload, and complete special record. A Data Unit whose padded
+    /// length exceeds the remaining input returns [`FitsError::Truncated`]
+    /// before its payload allocation is attempted.
+    pub fn from_bytes_with_limits(bytes: &[u8], limits: FitsLimits) -> Result<Self, FitsError> {
         if bytes.is_empty() {
             return Err(FitsError::EmptyFile);
         }
 
-        let mut reader = FitsReader::new(Cursor::new(bytes));
+        let mut reader = FitsReader::with_limits(Cursor::new(bytes), limits);
+        let mut owned_remaining = limits.max_owned_bytes;
         let mut hdus = Vec::new();
-        while let Some(index) = reader.next_hdu()? {
+        while let Some(index) = reader.next_hdu_with_budget(Some(owned_remaining))? {
+            let consumed =
+                reader.reader.get_ref().position() as usize - reader.reader.buffer().len();
+            let available = bytes.len() - consumed;
+            let padded = padded_size(index.data_size)?;
+            if padded > available {
+                return Err(FitsError::Truncated {
+                    offset: bytes.len(),
+                    expected: padded - available,
+                });
+            }
+            owned_remaining = owned_remaining
+                .checked_sub(index.header.header_size)
+                .and_then(|remaining| remaining.checked_sub(index.data_size))
+                .ok_or_else(|| limit_error("owned FITS read", limits.max_owned_bytes))?;
             let data = reader.read_data()?;
             hdus.push(Hdu {
                 header: index.header,
                 data,
             });
         }
-        let special_records = reader.read_special_records()?;
+        let special_records = reader.read_special_records_with_budget(owned_remaining)?;
         Ok(Self {
             hdus,
             special_records,
@@ -257,7 +428,12 @@ impl FitsFile {
     }
 }
 
-fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
+fn parse_header<R: Read>(
+    reader: &mut R,
+    mut prefix: &[u8],
+    limits: FitsLimits,
+    owned_remaining: Option<usize>,
+) -> Result<Header, FitsError> {
     let mut cards = Vec::new();
     let mut raw_cards = Vec::new();
     let mut raw_bytes = Vec::new();
@@ -265,9 +441,18 @@ fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
     let mut block = [0_u8; BLOCK_SIZE];
 
     loop {
-        reader.read_exact(&mut block).map_err(io_error)?;
+        let next_size = checked_add(header_size, BLOCK_SIZE, "header size")?;
+        check_limit(next_size, limits.max_header_bytes, "header")?;
+        if owned_remaining.is_some_and(|remaining| next_size > remaining) {
+            return Err(limit_error("owned FITS read", limits.max_owned_bytes));
+        }
+        block[..prefix.len()].copy_from_slice(prefix);
+        reader
+            .read_exact(&mut block[prefix.len()..])
+            .map_err(io_error)?;
+        prefix = &[];
         raw_bytes.extend_from_slice(&block);
-        header_size += BLOCK_SIZE;
+        header_size = next_size;
         let mut found_end = false;
         for card_bytes in block.chunks_exact(CARD_SIZE) {
             if card_bytes.iter().any(|byte| !(32..=126).contains(byte)) {
@@ -301,11 +486,11 @@ fn parse_header<R: Read>(reader: &mut R) -> Result<Header, FitsError> {
     }
 }
 
-fn copy_exact_checksum<R: Read, W: Write>(
+fn copy_exact<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     size: usize,
-    checksum: &mut OnesComplement,
+    mut checksum: Option<&mut OnesComplement>,
 ) -> Result<(), FitsError> {
     let mut remaining = size;
     let mut buffer = [0_u8; IO_BUFFER_SIZE];
@@ -314,29 +499,37 @@ fn copy_exact_checksum<R: Read, W: Write>(
         reader
             .read_exact(&mut buffer[..requested])
             .map_err(io_error)?;
-        checksum.update(&buffer[..requested]);
+        if let Some(checksum) = &mut checksum {
+            checksum.update(&buffer[..requested]);
+        }
         writer.write_all(&buffer[..requested]).map_err(io_error)?;
         remaining -= requested;
     }
     Ok(())
 }
 
-fn copy_exact<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    size: usize,
-) -> Result<(), FitsError> {
-    let mut remaining = size;
-    let mut buffer = [0_u8; IO_BUFFER_SIZE];
-    while remaining > 0 {
-        let requested = remaining.min(buffer.len());
-        reader
-            .read_exact(&mut buffer[..requested])
-            .map_err(io_error)?;
-        writer.write_all(&buffer[..requested]).map_err(io_error)?;
-        remaining -= requested;
+fn read_up_to<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize, FitsError> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+    Ok(filled)
+}
+
+fn check_limit(size: usize, limit: usize, resource: &'static str) -> Result<(), FitsError> {
+    if size > limit {
+        return Err(limit_error(resource, limit));
     }
     Ok(())
+}
+
+fn limit_error(resource: &'static str, limit: usize) -> FitsError {
+    FitsError::LimitExceeded { resource, limit }
 }
 
 fn decode_value(representation: DataRepresentation, bytes: &[u8; 8]) -> DataValue {
@@ -360,49 +553,43 @@ fn decode_value(representation: DataRepresentation, bytes: &[u8; 8]) -> DataValu
 
 #[derive(Default)]
 struct OnesComplement {
-    sum: u64,
-    tail: Vec<u8>,
+    sum: u32,
+    tail: [u8; 4],
+    tail_len: usize,
 }
 
 impl OnesComplement {
     fn update(&mut self, bytes: &[u8]) {
         let mut bytes = bytes;
-        if !self.tail.is_empty() {
-            let needed = 4 - self.tail.len();
+        if self.tail_len != 0 {
+            let needed = self.tail.len() - self.tail_len;
             let take = needed.min(bytes.len());
-            self.tail.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-            if self.tail.len() == 4 {
-                self.add_word(&self.tail.clone());
-                self.tail.clear();
+            self.tail[self.tail_len..self.tail_len + take].copy_from_slice(&bytes[..take]);
+            self.tail_len += take;
+            if self.tail_len < self.tail.len() {
+                return;
             }
+            self.sum = fold_sum(self.sum, u32::from_be_bytes(self.tail));
+            bytes = &bytes[take..];
         }
-        for chunk in bytes.chunks_exact(4) {
-            self.add_word(chunk);
+        let mut words = bytes.chunks_exact(4);
+        for word in &mut words {
+            self.sum = fold_sum(
+                self.sum,
+                u32::from_be_bytes([word[0], word[1], word[2], word[3]]),
+            );
         }
-        self.tail
-            .extend_from_slice(bytes.chunks_exact(4).remainder());
-    }
-
-    fn add_word(&mut self, word: &[u8]) {
-        self.sum += u32::from_be_bytes([word[0], word[1], word[2], word[3]]) as u64;
-        self.fold();
-    }
-
-    fn fold(&mut self) {
-        while self.sum >> 32 != 0 {
-            self.sum = (self.sum & 0xffff_ffff) + (self.sum >> 32);
-        }
+        let remainder = words.remainder();
+        self.tail_len = remainder.len();
+        self.tail[..self.tail_len].copy_from_slice(remainder);
     }
 
     fn finish(mut self) -> u32 {
-        if !self.tail.is_empty() {
-            let mut word = [0_u8; 4];
-            word[..self.tail.len()].copy_from_slice(&self.tail);
-            self.add_word(&word);
+        if self.tail_len != 0 {
+            self.tail[self.tail_len..].fill(0);
+            self.sum = fold_sum(self.sum, u32::from_be_bytes(self.tail));
         }
-        self.fold();
-        self.sum as u32
+        self.sum
     }
 }
 
@@ -420,20 +607,11 @@ fn validate_data_checksum(expected: Option<u32>, actual: u32) -> Result<(), Fits
     Ok(())
 }
 
-fn validate_hdu_checksum(header_bytes: Option<&[u8]>, data_sum: u32) -> Result<(), FitsError> {
-    let Some(header_bytes) = header_bytes else {
+fn validate_hdu_checksum(header_sum: Option<u32>, data_sum: u32) -> Result<(), FitsError> {
+    let Some(header_sum) = header_sum else {
         return Ok(());
     };
-    let mut header_sum = OnesComplement::default();
-    let mut header_bytes = header_bytes.to_vec();
-    for card in header_bytes.chunks_exact_mut(CARD_SIZE) {
-        if &card[..8] == b"CHECKSUM" {
-            card[11..27].fill(b'0');
-            break;
-        }
-    }
-    header_sum.update(&header_bytes);
-    let actual = fold_sum(header_sum.finish(), data_sum);
+    let actual = fold_sum(header_sum, data_sum);
     if actual != u32::MAX {
         return Err(FitsError::ChecksumMismatch {
             keyword: "CHECKSUM".to_string(),
@@ -445,11 +623,8 @@ fn validate_hdu_checksum(header_bytes: Option<&[u8]>, data_sum: u32) -> Result<(
 }
 
 fn fold_sum(left: u32, right: u32) -> u32 {
-    let mut sum = left as u64 + right as u64;
-    while sum >> 32 != 0 {
-        sum = (sum & 0xffff_ffff) + (sum >> 32);
-    }
-    sum as u32
+    let (sum, carry) = left.overflowing_add(right);
+    sum + u32::from(carry)
 }
 
 fn io_error(error: io::Error) -> FitsError {
@@ -648,12 +823,8 @@ fn split_value_comment(field: &str) -> (String, Option<String>) {
     (field.trim_end().to_string(), None)
 }
 
-fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
-    let keywords: Vec<&str> = header
-        .cards
-        .iter()
-        .map(|card| card.keyword.as_str())
-        .collect();
+fn validate_header(header: &Header, primary: bool) -> Result<IntegrityKeywords, FitsError> {
+    let keywords = || header.cards.iter().map(|card| card.keyword.as_str());
     let naxis = validate_integer(header, "NAXIS", |value| (0..=999).contains(&value))?;
     let naxis = naxis as usize;
     let random_groups = primary && header.value("GROUPS") == Some("T");
@@ -682,21 +853,23 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
     } else if !primary {
         expected.extend(["PCOUNT".to_string(), "GCOUNT".to_string()]);
     }
-    for (index, expected_keyword) in expected.iter().enumerate() {
-        if keywords.get(index) != Some(&expected_keyword.as_str()) {
-            return Err(if keywords.get(index).is_none() {
+    let mut actual = keywords();
+    for expected_keyword in expected {
+        let keyword = actual.next();
+        if keyword != Some(expected_keyword.as_str()) {
+            return Err(if keyword.is_none() {
                 FitsError::MissingMandatoryKeyword {
-                    keyword: (*expected_keyword).to_string(),
+                    keyword: expected_keyword,
                 }
             } else {
                 FitsError::InvalidKeywordOrder {
-                    keyword: (*expected_keyword).to_string(),
+                    keyword: expected_keyword,
                 }
             });
         }
     }
     if primary {
-        if keywords.contains(&"XTENSION") {
+        if keywords().any(|keyword| keyword == "XTENSION") {
             return Err(FitsError::InvalidKeywordOrder {
                 keyword: "XTENSION".to_string(),
             });
@@ -712,7 +885,7 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
             validate_fixed_integer(header, "GCOUNT")?;
         }
     } else {
-        if keywords.contains(&"SIMPLE") {
+        if keywords().any(|keyword| keyword == "SIMPLE") {
             return Err(FitsError::InvalidKeywordOrder {
                 keyword: "SIMPLE".to_string(),
             });
@@ -721,7 +894,7 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
         validate_fixed_string(header, "XTENSION", true)?;
         validate_integer(header, "PCOUNT", |value| value >= 0)?;
         validate_integer(header, "GCOUNT", |value| value >= 0)?;
-        if let Some(index) = keywords.iter().position(|keyword| *keyword == "INHERIT") {
+        if let Some(index) = keywords().position(|keyword| keyword == "INHERIT") {
             let mandatory_count = 5 + naxis;
             if index != mandatory_count {
                 return Err(FitsError::InvalidReservedPlacement {
@@ -732,7 +905,8 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
     }
     validate_reserved_keywords(header, primary)?;
     validate_array_keywords(header, primary)?;
-    validate_extension_and_integrity_keywords(header, primary)?;
+    validate_extension_keywords(header, primary)?;
+    let integrity = parse_integrity_keywords(header)?;
     if random_groups {
         validate_random_groups_keywords(header, naxis)?;
     }
@@ -757,7 +931,7 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
         validate_fixed_integer(header, "PCOUNT")?;
         validate_fixed_integer(header, "GCOUNT")?;
     }
-    for keyword in keywords {
+    for keyword in keywords() {
         if let Some(axis) = indexed_axis(keyword) {
             if axis == 0 || axis > naxis {
                 return Err(FitsError::InvalidKeywordOrder {
@@ -766,7 +940,7 @@ fn validate_header(header: &Header, primary: bool) -> Result<(), FitsError> {
             }
         }
     }
-    Ok(())
+    Ok(integrity)
 }
 
 fn validate_reserved_keywords(header: &Header, primary: bool) -> Result<(), FitsError> {
@@ -774,7 +948,7 @@ fn validate_reserved_keywords(header: &Header, primary: bool) -> Result<(), Fits
         match card.keyword.as_str() {
             keyword if keyword.starts_with("DATE") => validate_date_keyword(card)?,
             "ORIGIN" | "TELESCOP" | "INSTRUME" | "OBSERVER" | "OBJECT" | "AUTHOR" | "REFERENC" => {
-                validate_string(header, card.keyword.as_str())?
+                validate_string_value(&card.keyword, card.value.as_ref())?
             }
             "EXTEND" => {
                 if !primary {
@@ -782,7 +956,7 @@ fn validate_reserved_keywords(header: &Header, primary: bool) -> Result<(), Fits
                         keyword: "EXTEND".to_string(),
                     });
                 }
-                validate_logical(header, "EXTEND")?;
+                validate_logical_value(&card.keyword, card.value.as_ref())?;
             }
             "BLOCKED" => {
                 if !primary || index >= 36 {
@@ -790,10 +964,15 @@ fn validate_reserved_keywords(header: &Header, primary: bool) -> Result<(), Fits
                         keyword: "BLOCKED".to_string(),
                     });
                 }
-                if header.value("BLOCKED") != Some("T") {
+                if !matches!(&card.value, Some(Value::Logical(value)) if value == "T") {
                     return Err(FitsError::InvalidReservedValue {
-                        keyword: "BLOCKED".to_string(),
-                        value: header.value("BLOCKED").unwrap_or("missing").to_string(),
+                        keyword: card.keyword.clone(),
+                        value: card
+                            .value
+                            .as_ref()
+                            .and_then(Value::as_str)
+                            .unwrap_or("missing")
+                            .to_string(),
                     });
                 }
             }
@@ -810,10 +989,11 @@ fn validate_random_groups_keywords(header: &Header, naxis: usize) -> Result<(), 
             value: naxis.to_string(),
         });
     }
-    let parameter_count = header
-        .value("PCOUNT")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
+    let parameter_count = keyword_usize(header, "PCOUNT")?;
+    const PSCAL: u8 = 1;
+    const PZERO: u8 = 2;
+    // A parameter keyword has a five-byte prefix and at most three index digits.
+    let mut scaling = [0_u8; 1000];
     for card in &header.cards {
         let prefix = card.keyword.get(..5).unwrap_or("");
         let suffix = card.keyword.get(5..).unwrap_or("");
@@ -831,36 +1011,34 @@ fn validate_random_groups_keywords(header: &Header, naxis: usize) -> Result<(), 
                 keyword: card.keyword.clone(),
             });
         }
-        match prefix {
-            "PTYPE" => validate_string(header, &card.keyword)?,
-            "PSCAL" | "PZERO" => {
-                if !is_real_value(header, &card.keyword) {
-                    return Err(FitsError::InvalidReservedValue {
-                        keyword: card.keyword.clone(),
-                        value: "expected a floating-point value".to_string(),
-                    });
-                }
+        match (prefix, &card.value) {
+            ("PTYPE", value) => validate_string_value(&card.keyword, value.as_ref())?,
+            ("PSCAL" | "PZERO", Some(Value::Integer(_) | Value::Real(_))) => {
+                scaling[index] |= if prefix == "PSCAL" { PSCAL } else { PZERO };
+            }
+            ("PSCAL" | "PZERO", _) => {
+                return Err(FitsError::InvalidReservedValue {
+                    keyword: card.keyword.clone(),
+                    value: "expected a floating-point value".to_string(),
+                });
             }
             _ => unreachable!(),
         }
     }
-    for index in 1..=parameter_count {
-        let pscale = format!("PSCAL{index}");
-        let pzero = format!("PZERO{index}");
-        if header.cards.iter().any(|card| card.keyword == pscale)
-            != header.cards.iter().any(|card| card.keyword == pzero)
-        {
-            return Err(FitsError::InvalidReservedValue {
-                keyword: pscale,
-                value: "PSCALn and PZEROn must be used together".to_string(),
-            });
-        }
+    if let Some(index) = scaling
+        .iter()
+        .position(|flags| matches!(*flags, PSCAL | PZERO))
+    {
+        return Err(FitsError::InvalidReservedValue {
+            keyword: format!("PSCAL{index}"),
+            value: "PSCALn and PZEROn must be used together".to_string(),
+        });
     }
     Ok(())
 }
 
 fn validate_array_keywords(header: &Header, primary: bool) -> Result<(), FitsError> {
-    let is_image = primary || header.value("XTENSION") == Some("IMAGE");
+    let is_image = primary || extension_type(header) == Some("IMAGE");
     let array_keywords = ["BSCALE", "BZERO", "BUNIT", "BLANK", "DATAMIN", "DATAMAX"];
     if !is_image {
         if let Some(keyword) = array_keywords
@@ -926,19 +1104,9 @@ fn validate_array_keywords(header: &Header, primary: bool) -> Result<(), FitsErr
     Ok(())
 }
 
-fn validate_extension_and_integrity_keywords(
-    header: &Header,
-    primary: bool,
-) -> Result<(), FitsError> {
-    for keyword in ["EXTNAME", "DATASUM", "CHECKSUM"] {
-        if header.cards.iter().any(|card| card.keyword == keyword)
-            && !matches!(card_value(header, keyword), Some(Value::String(_)))
-        {
-            return Err(FitsError::InvalidReservedValue {
-                keyword: keyword.to_string(),
-                value: "expected a character string".to_string(),
-            });
-        }
+fn validate_extension_keywords(header: &Header, primary: bool) -> Result<(), FitsError> {
+    if let Some(card) = header.cards.iter().find(|card| card.keyword == "EXTNAME") {
+        reserved_string(card)?;
     }
     for keyword in ["EXTVER", "EXTLEVEL"] {
         if header.cards.iter().any(|card| card.keyword == keyword)
@@ -966,33 +1134,81 @@ fn validate_extension_and_integrity_keywords(
         }
         validate_logical(header, "INHERIT")?;
     }
-    validate_datasum(header)?;
-    validate_checksum(header)?;
     Ok(())
 }
 
-fn validate_datasum(header: &Header) -> Result<(), FitsError> {
-    let Some(Value::String(value)) = card_value(header, "DATASUM") else {
-        return Ok(());
-    };
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-        Ok(())
-    } else {
-        Err(FitsError::InvalidIntegrityKeyword {
-            keyword: "DATASUM".to_string(),
-            message: "expected an unsigned decimal string or blanks".to_string(),
-        })
-    }
+struct IntegrityKeywords {
+    datasum: Option<u32>,
+    has_checksum: bool,
 }
 
-fn validate_checksum(header: &Header) -> Result<(), FitsError> {
-    let Some(Value::String(value)) = card_value(header, "CHECKSUM") else {
-        return Ok(());
+fn parse_integrity_keywords(header: &Header) -> Result<IntegrityKeywords, FitsError> {
+    let mut datasum = None;
+    let mut checksum = None;
+    for card in &header.cards {
+        match card.keyword.as_str() {
+            "DATASUM" => validate_integrity_repeat(&mut datasum, parse_datasum(card)?, card)?,
+            "CHECKSUM" => validate_integrity_repeat(&mut checksum, parse_checksum(card)?, card)?,
+            _ => {}
+        }
+    }
+    Ok(IntegrityKeywords {
+        datasum: datasum.flatten(),
+        has_checksum: checksum.flatten().is_some(),
+    })
+}
+
+fn validate_integrity_repeat<T: PartialEq>(
+    previous: &mut Option<T>,
+    value: T,
+    card: &Card,
+) -> Result<(), FitsError> {
+    if previous.as_ref().is_some_and(|previous| *previous != value) {
+        return Err(FitsError::InvalidIntegrityKeyword {
+            keyword: card.keyword.clone(),
+            message: "conflicting duplicate values".to_string(),
+        });
+    }
+    *previous = Some(value);
+    Ok(())
+}
+
+fn reserved_string(card: &Card) -> Result<&str, FitsError> {
+    let Some(Value::String(value)) = &card.value else {
+        return Err(FitsError::InvalidReservedValue {
+            keyword: card.keyword.clone(),
+            value: "expected a character string".to_string(),
+        });
     };
-    let trimmed = value.trim();
-    if trimmed.is_empty() || value.len() == 16 {
-        Ok(())
+    Ok(value)
+}
+
+fn parse_datasum(card: &Card) -> Result<Option<u32>, FitsError> {
+    let trimmed = reserved_string(card)?.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return trimmed
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| FitsError::InvalidIntegrityKeyword {
+                keyword: card.keyword.clone(),
+                message: "value exceeds the unsigned 32-bit range".to_string(),
+            });
+    }
+    Err(FitsError::InvalidIntegrityKeyword {
+        keyword: card.keyword.clone(),
+        message: "expected an unsigned decimal string or blanks".to_string(),
+    })
+}
+
+fn parse_checksum(card: &Card) -> Result<Option<&str>, FitsError> {
+    let value = reserved_string(card)?;
+    if value.trim().is_empty() {
+        Ok(None)
+    } else if value.len() == 16 {
+        Ok(Some(value))
     } else {
         Err(FitsError::InvalidIntegrityKeyword {
             keyword: "CHECKSUM".to_string(),
@@ -1138,16 +1354,31 @@ fn validate_logical(header: &Header, keyword: &str) -> Result<(), FitsError> {
     Ok(())
 }
 
-fn validate_string(header: &Header, keyword: &str) -> Result<(), FitsError> {
-    let is_string = header
-        .cards
-        .iter()
-        .find(|card| card.keyword == keyword)
-        .is_some_and(|card| matches!(card.value.as_ref(), Some(Value::String(_))));
-    if !is_string {
+fn validate_logical_value(keyword: &str, value: Option<&Value>) -> Result<(), FitsError> {
+    if !matches!(value, Some(Value::Logical(value)) if value == "T" || value == "F") {
         return Err(FitsError::InvalidMandatoryValue {
             keyword: keyword.to_string(),
-            value: header.value(keyword).unwrap_or("missing").to_string(),
+            value: value
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_string(header: &Header, keyword: &str) -> Result<(), FitsError> {
+    validate_string_value(keyword, card_value(header, keyword))
+}
+
+fn validate_string_value(keyword: &str, value: Option<&Value>) -> Result<(), FitsError> {
+    if !matches!(value, Some(Value::String(_))) {
+        return Err(FitsError::InvalidMandatoryValue {
+            keyword: keyword.to_string(),
+            value: value
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+                .to_string(),
         });
     }
     Ok(())
@@ -1246,16 +1477,14 @@ fn data_size(header: &Header, primary: bool) -> Result<usize, FitsError> {
         );
     }
     let axes = axis_product(header)?;
-    let array_bytes = checked_mul(axes, bytes_per_value(header)?, "BITPIX/NAXIS")?;
-    let with_parameters = checked_add(
-        array_bytes,
-        keyword_usize_or_zero(header, "PCOUNT")?,
-        "PCOUNT",
-    )?;
+    if primary {
+        return checked_mul(axes, bytes_per_value(header)?, "BITPIX/NAXIS");
+    }
+    let with_parameters = checked_add(axes, keyword_usize(header, "PCOUNT")?, "PCOUNT")?;
     checked_mul(
-        with_parameters,
-        keyword_usize_or_one(header, "GCOUNT")?,
-        "GCOUNT",
+        checked_mul(with_parameters, keyword_usize(header, "GCOUNT")?, "GCOUNT")?,
+        bytes_per_value(header)?,
+        "BITPIX/GCOUNT",
     )
 }
 
@@ -1319,12 +1548,6 @@ fn keyword_usize_or_zero(header: &Header, keyword: &str) -> Result<usize, FitsEr
     header
         .value(keyword)
         .map_or(Ok(0), |_| keyword_usize(header, keyword))
-}
-
-fn keyword_usize_or_one(header: &Header, keyword: &str) -> Result<usize, FitsError> {
-    header
-        .value(keyword)
-        .map_or(Ok(1), |_| keyword_usize(header, keyword))
 }
 
 fn checked_mul(left: usize, right: usize, keyword: &str) -> Result<usize, FitsError> {

@@ -1,106 +1,96 @@
 # RustFitsAI
 
-A standalone Rust application boilerplate for reading and writing FITS files.
+A Rust library and command line tool for reading astronomical FITS files.
 
-## FITS Format
+## Description
 
-FITS (Flexible Image Transport System) is a block-based format for storing
-astronomical data in Header and Data Units (HDUs). This implementation is based
-on the current FITS Standard, version 4.0: [FITS Standard 4.0](https://fits.gsfc.nasa.gov/standard40/fits_standard40aa-le.pdf).
+RustFitsAI reads the Header and Data Units (HDUs) in a FITS file. Use the command
+line tool to inspect an observation, print its header cards or make a verified
+copy. The library gives you the same reader so you can process an image one
+data unit at a time.
 
-The FITS reader parses a file into HDUs. Each HDU contains its parsed header
-cards and its unpadded data bytes. Headers and data are located according to
-the FITS 2880-byte block and 80-byte card rules. Primary HDUs, standard image
-and table extensions, and other extension names are processed in file order.
-Extension data sizes use the FITS `BITPIX`, `NAXISn`, `PCOUNT`, and `GCOUNT`
-keywords. Trailing non-extension blocks are preserved as raw
-`FitsFile::special_records`, one 2880-byte block per entry, and their first
-eight bytes are validated not to contain `XTENSION`.
+## Getting started
 
-For large files, use the streaming `FitsReader`: `next_hdu()` reads only the
-header as an index, while `read_data_to()` streams the corresponding Data Unit
-to a writer and `skip_data()` discards it without allocating the full Data Unit.
-The `read_data()` method is available when an in-memory Data Unit is explicitly
-needed. `FitsFile::from_bytes()` remains a convenience API for already-loaded
-byte slices. The streaming reader treats an incomplete trailing physical block
-after the last complete FITS structure as media padding and discards it.
+You need Rust and Cargo with support for the 2024 edition. From the project
+directory, try the included synthetic 2 × 2 image. It has four pixels and a
+second, empty image extension.
 
-Data Units can also be decoded incrementally with `read_data_values()`. The
-decoder handles FITS big-endian signed integers and IEEE-754 values according
-to `BITPIX`; `BITPIX=8` is exposed as raw bytes because FITS uses it for both
-unsigned byte arrays and ASCII character data.
-
-Deprecated FITS random-groups primary arrays are recognized and validated
-according to Section 6. Their `PCOUNT`, `GCOUNT`, axes, and parameter metadata
-are available through `HduIndex::random_groups()`.
-
-Header Values are exposed as `Value::String`, `Value::Logical`, `Value::Integer`,
-`Value::Real`, `Value::ComplexInteger`, `Value::ComplexReal`, or
-`Value::Undefined`. Quoted strings decode doubled single quotes, and
-`Header::string_value()` reconstructs FITS 4.0 `CONTINUE` long-string records.
-FITS dates are not a separate value datatype: ISO-8601 datetime strings can be
-validated with `Value::as_datetime()`, while physical units can be inspected as
-restricted-ASCII strings with `Value::as_unit()`.
-
-## Usage
-
-```text
-cargo run -- [-v|--verbose] <input-path> [output-path]
+```sh
+cargo run --locked -- tests/fixtures/image.fits
 ```
 
-The app reads and validates the input FITS file, then prints one-line details
-for each HDU. When an output path is supplied, it also writes the original
-bytes to that path.
+The primary HDU contains 4 data bytes. Use `-v` or `--verbose` to print the
+80-character header cards. To save a byte-for-byte copy, supply a new filename.
 
-Parse only:
-
-```text
-cargo run -- input.fits
+```sh
+cargo run --locked -- --verbose tests/fixtures/image.fits
+cargo run --locked -- tests/fixtures/image.fits copy.fits
+cargo run --locked -- --help
 ```
 
-Parse and write a copy:
+Choose an output directory you control. The copy appears after the whole file
+passes the selected checks. An existing destination is refused, including a
+link to the input. By default the reader checks any supplied `DATASUM` and
+`CHECKSUM` values. Use `--lax` to inspect
+a file while skipping those comparisons. Header syntax and data lengths are
+still checked.
 
-```text
-cargo run -- input.fits output.fits
+## Features
+
+- Read the primary HDU, image and table extensions, and other conforming
+  extension types in file order. Table data is available as raw bytes.
+- Stream a data unit to a writer or decode its stored values using `BITPIX`.
+  Integers and floating-point values use FITS big-endian byte order.
+- Inspect typed header values, `CONTINUE` strings and random-groups metadata.
+  Trailing special records are available as complete 2880-byte blocks.
+
+The reader checks FITS structure and selected keywords. Table column schemas
+and image rendering are outside its scope. [FITS Standard 4.0](https://science.data.nasa.gov/fits/documentation/standard)
+
+## Documentation
+
+### Reading a FITS file
+
+`next_hdu()` reads a header. Consume or skip its data before requesting the
+next HDU. This example prints the size of each data unit in the sample file.
+
+```rust
+use rustfitsai::FitsReader;
+use std::{error::Error, fs::File, io};
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut reader = FitsReader::new(File::open("tests/fixtures/image.fits")?);
+    while let Some(hdu) = reader.next_hdu()? {
+        println!("{} data bytes", hdu.data_size);
+        reader.skip_data()?;
+    }
+    reader.copy_special_records_to(io::sink())?;
+    Ok(())
+}
 ```
 
-Verbose mode prints every logical 80-character header card for each HDU:
+Use `read_data_to()` for raw bytes or `read_data_values()` for individual
+values. The final checksum becomes available after the last byte of the HDU.
+Treat streamed output as provisional until the method succeeds.
 
-```text
-cargo run -- --verbose input.fits
-```
+### Working with large files
 
-For command help:
+The default header limit is 1 MiB per HDU. Set `--max-header-bytes N` on the
+command line if an observation needs a larger header. The in-memory readers
+have a 256 MiB limit on the FITS bytes they collect. `FitsFile::from_bytes()` applies
+it across the complete file it builds. Parsed cards and other Rust structures
+use additional memory. Streaming a data unit to a writer can exceed 256 MiB.
+Use `FitsReader::with_limits()` or `FitsFile::from_bytes_with_limits()` to
+choose limits appropriate for your observations.
 
-```text
-cargo run -- --help
-```
+## Tests
 
-## Project layout
-
-```text
-src/
-	lib.rs              Public library API
-	main.rs             Command-line application and file I/O
-	fits/
-		mod.rs            FITS module surface
-		model.rs          FITS data models
-		parser.rs         Header and HDU parsing
-		error.rs          Parser error types
-tests/
-	fits_parser.rs      Public API integration tests
-demoData/             Local, Git-ignored sample files
-```
-
-## Development
-
-```text
-cargo check
-cargo fmt -- --check
-cargo test
+```sh
+cargo fmt --all --check
+cargo test --locked
+cargo doc --locked --no-deps --open
 ```
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for
-the full license text.
+Released under the MIT License. [License text](https://github.com/brampf/RustFitsAI/blob/master/LICENSE)

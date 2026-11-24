@@ -16,4 +16,4 @@ pub use model::{
     Card, DataRepresentation, DataValue, DateTime, FitsFile, Hdu, HduIndex, Header,
     RandomGroupsDescriptor, UnitString, Value,
 };
-pub use parser::{BLOCK_SIZE, CARD_SIZE, FitsReader};
+pub use parser::{BLOCK_SIZE, CARD_SIZE, FitsLimits, FitsReader};

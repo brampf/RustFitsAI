@@ -74,6 +74,13 @@ pub enum FitsError {
     DataPending,
     NoPendingData,
     SpecialRecordsNotReady,
+    /// A previous parsing or streaming error left the reader unusable.
+    ReaderFailed,
+    /// A configured size limit was exceeded. `limit` is measured in bytes.
+    LimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
     SizeOverflow {
         keyword: String,
     },
@@ -176,6 +183,13 @@ impl fmt::Display for FitsError {
                 write!(
                     formatter,
                     "the reader has not reached the special-record section"
+                )
+            }
+            Self::ReaderFailed => write!(formatter, "the FITS reader stopped after an error"),
+            Self::LimitExceeded { resource, limit } => {
+                write!(
+                    formatter,
+                    "FITS {resource} exceeds the configured limit of {limit} bytes"
                 )
             }
             Self::SizeOverflow { keyword } => {

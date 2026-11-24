@@ -31,7 +31,7 @@ pub struct Hdu {
 /// Section 4.4.1; the Data Unit remains in the input stream until requested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HduIndex {
-    /// Parsed header, raw cards, and checksum input bytes for this HDU.
+    /// Parsed header and original header bytes for this HDU.
     pub header: Header,
     /// Number of meaningful Data Unit bytes, excluding FITS block padding.
     pub data_size: usize,
@@ -149,9 +149,9 @@ pub struct Header {
     /// Exact printable 80-character cards through and including `END`.
     /// This convenience representation is retained for verbose output.
     pub raw_cards: Vec<String>,
-    /// Exact header bytes, including header padding, used for `CHECKSUM` checks.
+    /// Exact header bytes, including header padding.
     pub raw_bytes: Vec<u8>,
-    /// Header length in complete FITS blocks.
+    /// Header length in bytes, including padding to a complete FITS block.
     pub header_size: usize,
 }
 
