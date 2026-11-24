@@ -30,10 +30,13 @@ cargo run --locked -- --help
 
 Choose an output directory you control. The copy appears after the whole file
 passes the selected checks. An existing destination is refused, including a
-link to the input. By default the reader checks any supplied `DATASUM` and
-`CHECKSUM` values. Use `--lax` to inspect
-a file while skipping those comparisons. Header syntax and data lengths are
-still checked.
+link to the input.
+
+By default the reader checks any supplied `DATASUM` and `CHECKSUM` values.
+It includes the header padding after the `END` card in the HDU `CHECKSUM`
+without separately checking that each padding byte is an ASCII space.
+Use `--lax` to inspect a file while skipping the checksum comparisons.
+Header syntax and data lengths are still checked.
 
 ## Features
 
